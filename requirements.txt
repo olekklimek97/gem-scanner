@@ -1,0 +1,12 @@
+# Pinned versions — last verified on Python 3.14.3
+# Run: pip install -r requirements.txt
+#
+# All other imports across the project (json, sqlite3, http.server, threading,
+# pathlib, datetime, urllib.parse, concurrent.futures, dataclasses, typing,
+# base64, struct, collections, traceback, webbrowser) are from the Python
+# stdlib and do not need installation.
+
+requests==2.32.5
+solana==0.36.11
+solders==0.27.1
+base58==2.1.1

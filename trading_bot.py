@@ -1,0 +1,1491 @@
+#!/usr/bin/env python3
+"""
+🤖 SOLANA DEGEN TRADING BOT
+=============================
+Automatyczny bot tradingowy na Solanie.
+Kupuje tokeny znalezione przez Liftoff Sniper, zarządza pozycjami.
+
+Strategia:
+  1. Scanner znajduje token z wysokim score
+  2. Bot kupuje za ustaloną kwotę SOL
+  3. Monitoruje cenę co 30s
+  4. Take profit: przy +X% sprzedaje wkład, zostawia moonbag
+  5. Stop loss: przy -X% sprzedaje wszystko
+
+SETUP:
+  1. pip install solana solders requests base58
+  2. Stwórz NOWY wallet (NIGDY nie używaj głównego!)
+  3. Wrzuć na niego niewielką ilość SOL (np. 0.5 SOL)
+  4. Skopiuj private key i wklej do .env
+
+Uruchomienie:
+  python trading_bot.py                    # Tryb auto (kupuje z snipera)
+  python trading_bot.py --buy <CA> 0.01    # Ręczny zakup za 0.01 SOL
+  python trading_bot.py --sell <CA> 50     # Sprzedaj 50% pozycji
+  python trading_bot.py --status           # Pokaż pozycje
+  python trading_bot.py --dry-run          # Symulacja bez prawdziwych transakcji
+
+⚠️  DISCLAIMER: To nie jest porada inwestycyjna.
+    Bot operuje na REAL MONEY. Używaj tylko pieniędzy które możesz stracić.
+"""
+
+import requests
+import json
+import time
+import sys
+import os
+import base64
+import struct
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Optional
+
+# Import safety module
+try:
+    from safety_module import (
+        run_safety_check, run_full_safety_check, summarize_full_report,
+        check_and_sweep, SAFETY_CONFIG,
+        run_continuous_safety_checks, NEW_SAFETY_CONFIG,
+    )
+    SAFETY_AVAILABLE = True
+except ImportError:
+    SAFETY_AVAILABLE = False
+    print("  ⚠️  safety_module.py not found — safety checks DISABLED")
+    print("  Place safety_module.py in the same folder as trading_bot.py")
+
+
+def log_safety_event(trade_log, event: str, position, details: dict):
+    """Record a safety event in trade_log.json for the dashboard."""
+    try:
+        trade_log.log({
+            "action": "safety_event",
+            "event": event,
+            "token": getattr(position, "token_symbol", "?"),
+            "token_address": getattr(position, "token_address", ""),
+            "details": details,
+        })
+    except Exception as e:
+        print(f"     ⚠️  Failed to log safety event: {e}")
+
+# ─── KONFIGURACJA ───────────────────────────────────────────
+
+CONFIG = {
+    # ── Wallet ──
+    # OPCJA 1: Private key bezpośrednio (base58)
+    "private_key": os.environ.get("SOL_PRIVATE_KEY", ""),
+
+    # OPCJA 2: Ścieżka do pliku z private key
+    "private_key_file": "bot_wallet.key",
+
+    # ── RPC ──
+    # Domyślny publiczny RPC (wolny ale darmowy)
+    # Dla lepszej szybkości użyj Helius/QuickNode (darmowy tier)
+    "rpc_url": os.environ.get("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
+
+    # ── Jito MEV Protection ──
+    # Wysyła transakcje przez Jito Block Engine zamiast publicznego mempoola
+    # = ochrona przed sandwich attacks
+    "use_jito": True,
+    "jito_url": "https://frankfurt.mainnet.block-engine.jito.wtf/api/v1/transactions",
+    "jito_tip_lamports": 10_000,       # 0.00001 SOL tip dla Jito (min 1000)
+    "jito_tip_accounts": [             # Losowy wybór z oficjalnych tip accounts
+        "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
+        "HFqU5x63VTqvQss8hp11i4bVqkfRtQ7NmXwkiY8aq1Gs",
+        "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
+        "ADaUMid9yfUC5i9u4Xn1J33JFatd5Dn14t2LHLqYJ6J3",
+        "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
+        "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+        "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
+        "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+    ],
+
+    # ── Jupiter API ──
+    "jupiter_quote_url": "https://quote-api.jup.ag/v6/quote",
+    "jupiter_swap_url": "https://quote-api.jup.ag/v6/swap",
+
+    # ── Trading Parameters ──
+    "buy_amount_sol": 0.01,            # Ile SOL wydać na jeden zakup (~$1.50)
+                                       # Reviewer: 0.003 jest za małe — fees zjadają 5-30%
+    "max_positions": 10,               # Max otwartych pozycji
+    "max_daily_buys": 15,              # Max zakupów dziennie
+
+    # ── Take Profit Strategy (kaskadowy) ──
+    "take_profit_pct": 30,             # TP1 trigger: +30% → recover invested SOL
+    "moonbag_sell_pct": 0.12,          # Fraction of REMAINING tokens to sell on each cascade (12%)
+    "early_cascade_interval": 0.30,    # Spacing between TPs before widening (30%)
+    "late_cascade_interval": 0.50,     # Spacing between TPs after widening (50%)
+    "cascade_widen_after_level": 2,    # After cascade_level reaches this, switch to late interval
+                                       # Schedule: TP1 30%, TP2 60%, TP3 90%, TP4 140%, TP5 190%, ...
+    "min_moonbag_value_sol": 0.005,    # Below this, fees > profit — hold instead of cascade-selling
+
+    # Deprecated keys kept for back-compat with stale positions.json / show_status display:
+    "cascade_interval_pct": 30,        # superseded by early_cascade_interval × 100
+    "cascade_sell_pct": 25,             # superseded by moonbag_sell_pct × 100
+
+    # ── Stop Loss ──
+    "stop_loss_pct": -30,              # Sprzedaj wszystko przy -30%
+
+    # ── Slippage ──
+    "slippage_bps": 500,               # 5% slippage (reduced from 15% — Jito protects against sandwich)
+
+    # ── Priority Fee ──
+    "priority_fee_lamports": 100_000,  # 0.0001 SOL priority fee
+
+    # ── Monitoring ──
+    "price_check_interval": 30,        # Sprawdzaj ceny co 30s
+    "min_score_to_buy": 70,            # Min score z snipera żeby kupił (70+ = STRONG)
+
+    # ── Files ──
+    "positions_file": "positions.json",
+    "trade_log_file": "trade_log.json",
+
+    # ── Safety ──
+    "dry_run": True,                   # DOMYŚLNIE True — musisz wyłączyć jawnie: --live
+}
+
+# Solana constants
+SOL_MINT = "So11111111111111111111111111111111111111111112"
+LAMPORTS_PER_SOL = 1_000_000_000
+
+
+# ─── WALLET ─────────────────────────────────────────────────
+
+class Wallet:
+    """Simple wallet wrapper."""
+
+    def __init__(self, private_key_b58: str):
+        try:
+            from solders.keypair import Keypair
+            import base58
+            self.keypair = Keypair.from_bytes(base58.b58decode(private_key_b58))
+            self.public_key = str(self.keypair.pubkey())
+            self.ready = True
+        except ImportError:
+            print("  ⚠️  Pakiety solana/solders nie zainstalowane.")
+            print("  Uruchom: pip install solana solders base58")
+            self.ready = False
+        except Exception as e:
+            print(f"  ❌ Błąd ładowania walleta: {e}")
+            self.ready = False
+
+    def sign_transaction(self, raw_tx_b64: str) -> Optional[str]:
+        """Sign a base64-encoded transaction and return signed base64."""
+        try:
+            from solders.transaction import VersionedTransaction
+            raw_bytes = base64.b64decode(raw_tx_b64)
+            tx = VersionedTransaction.from_bytes(raw_bytes)
+            signed_tx = VersionedTransaction(tx.message, [self.keypair])
+            return base64.b64encode(bytes(signed_tx)).decode('utf-8')
+        except Exception as e:
+            print(f"  ❌ Błąd podpisywania tx: {e}")
+            return None
+
+
+def load_wallet() -> Optional[Wallet]:
+    """Load wallet from config."""
+    pk = CONFIG["private_key"]
+
+    # Try env var first
+    if pk:
+        return Wallet(pk)
+
+    # Try file
+    pk_file = Path(CONFIG["private_key_file"])
+    if pk_file.exists():
+        pk = pk_file.read_text().strip()
+        if pk:
+            return Wallet(pk)
+
+    return None
+
+
+# ─── JUPITER SWAP ───────────────────────────────────────────
+
+# Circuit breaker for Jupiter — avoids 10s timeouts on every pre-buy when DNS/network is broken.
+_JUPITER_CB = {
+    "consecutive_failures": 0,
+    "open_until": 0.0,           # epoch seconds; if time.time() < this, breaker is OPEN (skip calls)
+    "fail_threshold": 3,         # open the breaker after N consecutive failures
+    "open_duration_sec": 60,     # how long to stay open before testing again
+}
+
+
+def _jupiter_breaker_open() -> bool:
+    """Returns True if the breaker is currently OPEN (i.e. we should skip Jupiter)."""
+    return time.time() < _JUPITER_CB["open_until"]
+
+
+def _jupiter_record_failure():
+    _JUPITER_CB["consecutive_failures"] += 1
+    if _JUPITER_CB["consecutive_failures"] >= _JUPITER_CB["fail_threshold"]:
+        _JUPITER_CB["open_until"] = time.time() + _JUPITER_CB["open_duration_sec"]
+        print(f"  ⚡ Jupiter circuit breaker OPEN for {_JUPITER_CB['open_duration_sec']}s "
+              f"after {_JUPITER_CB['consecutive_failures']} failures")
+
+
+def _jupiter_record_success():
+    if _JUPITER_CB["consecutive_failures"] > 0 or _JUPITER_CB["open_until"] > 0:
+        _JUPITER_CB["consecutive_failures"] = 0
+        _JUPITER_CB["open_until"] = 0.0
+
+
+def get_quote(input_mint: str, output_mint: str, amount: int, slippage_bps: int = None) -> dict:
+    """Get Jupiter swap quote.
+    Short-circuits to None when the circuit breaker is open (no 10s timeout per call)."""
+    if _jupiter_breaker_open():
+        return None  # silent — breaker prints once when it opens
+
+    if slippage_bps is None:
+        slippage_bps = CONFIG["slippage_bps"]
+
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": str(amount),
+        "slippageBps": slippage_bps,
+    }
+    try:
+        resp = requests.get(CONFIG["jupiter_quote_url"], params=params, timeout=15)
+        resp.raise_for_status()
+        _jupiter_record_success()
+        return resp.json()
+    except Exception as e:
+        print(f"  ❌ Quote error: {e}")
+        _jupiter_record_failure()
+        return None
+
+
+def get_swap_transaction(quote: dict, user_pubkey: str) -> str:
+    """Get serialized swap transaction from Jupiter."""
+    payload = {
+        "quoteResponse": quote,
+        "userPublicKey": user_pubkey,
+        "wrapAndUnwrapSol": True,
+        "prioritizationFeeLamports": CONFIG["priority_fee_lamports"],
+    }
+    try:
+        resp = requests.post(CONFIG["jupiter_swap_url"], json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("swapTransaction", "")
+    except Exception as e:
+        print(f"  ❌ Swap tx error: {e}")
+        return ""
+
+
+def send_transaction(signed_tx_b64: str) -> Optional[str]:
+    """Send signed transaction — via Jito Block Engine if enabled, else standard RPC."""
+
+    if CONFIG.get("use_jito", False):
+        # ── JITO MEV-PROTECTED SEND ──
+        # bundleOnly=true = single-tx bundle, skips public mempool
+        jito_url = CONFIG["jito_url"] + "?bundleOnly=true"
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "sendTransaction",
+            "params": [
+                signed_tx_b64,
+                {"encoding": "base64"}
+            ]
+        }
+        try:
+            resp = requests.post(jito_url, json=payload, timeout=30)
+            data = resp.json()
+            if "result" in data:
+                print(f"     🛡️ Sent via Jito (MEV protected)")
+                return data["result"]
+            elif "error" in data:
+                print(f"  ⚠️  Jito error: {data['error']} — falling back to standard RPC")
+                # Fall through to standard RPC
+            else:
+                print(f"  ⚠️  Jito unexpected response — falling back to standard RPC")
+        except Exception as e:
+            print(f"  ⚠️  Jito failed ({e}) — falling back to standard RPC")
+
+    # ── STANDARD RPC SEND (fallback) ──
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [
+            signed_tx_b64,
+            {"encoding": "base64", "maxRetries": 3, "skipPreflight": True}
+        ]
+    }
+    try:
+        resp = requests.post(CONFIG["rpc_url"], json=payload, timeout=30)
+        data = resp.json()
+        if "result" in data:
+            return data["result"]
+        elif "error" in data:
+            print(f"  ❌ TX error: {data['error']}")
+            return None
+    except Exception as e:
+        print(f"  ❌ Send TX error: {e}")
+        return None
+
+
+def get_sol_balance(pubkey: str) -> float:
+    """Get SOL balance."""
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "getBalance",
+        "params": [pubkey]
+    }
+    try:
+        resp = requests.post(CONFIG["rpc_url"], json=payload, timeout=10)
+        data = resp.json()
+        lamports = data.get("result", {}).get("value", 0)
+        return lamports / LAMPORTS_PER_SOL
+    except:
+        return 0.0
+
+
+def get_token_balance(pubkey: str, mint: str) -> int:
+    """Get token balance for a specific mint."""
+    payload = {
+        "jsonrpc": "2.0", "id": 1,
+        "method": "getTokenAccountsByOwner",
+        "params": [
+            pubkey,
+            {"mint": mint},
+            {"encoding": "jsonParsed"}
+        ]
+    }
+    try:
+        resp = requests.post(CONFIG["rpc_url"], json=payload, timeout=10)
+        data = resp.json()
+        accounts = data.get("result", {}).get("value", [])
+        if accounts:
+            info = accounts[0]["account"]["data"]["parsed"]["info"]["tokenAmount"]
+            return int(info["amount"])
+        return 0
+    except:
+        return 0
+
+
+def get_token_price_sol(mint: str) -> float:
+    """Get token price in SOL using Jupiter quote."""
+    # Get price of 1M tokens worth in SOL
+    quote = get_quote(mint, SOL_MINT, 1_000_000_000, slippage_bps=100)
+    if quote:
+        out_amount = int(quote.get("outAmount", 0))
+        return out_amount / LAMPORTS_PER_SOL
+    return 0.0
+
+
+def get_dexscreener_price(token_address: str, pinned_pair_address: str = "") -> tuple:
+    """Get token price from DexScreener. Returns (price_in_sol, price_in_usd, pair_address_used).
+
+    CRITICAL: DexScreener `priceNative` is denominated in the QUOTE TOKEN of the pair
+    (SOL for SOL/X pairs, USDC for USDC/X pairs, etc.). If we naively pick the
+    highest-liquidity pair we may grab a USDC- or USDT-quoted pair and treat its
+    priceNative (USD per token) as if it were SOL per token — producing PnL values
+    that are off by ~150x or more.
+
+    This function therefore restricts to SOL-quoted pairs only:
+      - If `pinned_pair_address` is provided AND it's a SOL-quoted pair AND it still
+        has liquidity → use it.
+      - Otherwise pick the highest-liquidity SOL-quoted pair.
+      - If no SOL-quoted pair exists, return (0, 0, "") rather than guessing.
+
+    The pinned-pair behavior keeps PnL math consistent across cycles; the SOL-only
+    filter eliminates the cross-quote bug that produced 374-billion-x phantom returns.
+    """
+    try:
+        resp = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+            headers={"Accept": "application/json", "User-Agent": "DegenBot/1.0"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        pairs = resp.json().get("pairs") or []
+        if not pairs:
+            return 0.0, 0.0, ""
+
+        # Restrict to SOL-quoted pairs (where priceNative is in SOL)
+        sol_pairs = [p for p in pairs if (p.get("quoteToken") or {}).get("address") == SOL_MINT]
+        if not sol_pairs:
+            return 0.0, 0.0, ""
+
+        chosen = None
+        if pinned_pair_address:
+            for p in sol_pairs:
+                if p.get("pairAddress", "") == pinned_pair_address:
+                    liq = (p.get("liquidity") or {}).get("usd", 0) or 0
+                    if liq > 0:
+                        chosen = p
+                    break
+        if chosen is None:
+            chosen = max(sol_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0))
+
+        # Final guard: if the chosen pair has zero liquidity, the priceNative on it
+        # may be stale/garbage. Refuse to use it.
+        chosen_liq = (chosen.get("liquidity") or {}).get("usd", 0) or 0
+        if chosen_liq <= 0:
+            return 0.0, 0.0, ""
+
+        price_sol = float(chosen.get("priceNative") or 0)
+        price_usd = float(chosen.get("priceUsd") or 0)
+        return price_sol, price_usd, chosen.get("pairAddress", "")
+    except Exception as e:
+        print(f"     ⚠️  DexScreener price error: {e}")
+    return 0.0, 0.0, ""
+
+
+# ─── POSITION MANAGEMENT ────────────────────────────────────
+
+class Position:
+    """Represents an open position."""
+    def __init__(self, data: dict):
+        self.token_address = data["token_address"]
+        self.token_symbol = data.get("token_symbol", "?")
+        self.token_name = data.get("token_name", "?")
+        self.buy_amount_sol = data["buy_amount_sol"]
+        self.buy_amount_tokens = data["buy_amount_tokens"]
+        self.buy_price_sol = data.get("buy_price_sol", 0)
+        self.buy_time = data.get("buy_time", datetime.now(timezone.utc).isoformat())
+        self.buy_tx = data.get("buy_tx", "")
+        self.status = data.get("status", "open")  # open, partial, closed, stopped
+        self.tokens_remaining = data.get("tokens_remaining", data["buy_amount_tokens"])
+        self.total_sold_sol = data.get("total_sold_sol", 0)
+        self.sells = data.get("sells", [])
+        self.score = data.get("score", 0)
+        self.url = data.get("url", "")
+        self.cascade_level = data.get("cascade_level", 0)  # 0=no TP yet, 1=wkład recovered, 2+=cascades
+        self.peak_pnl_pct = data.get("peak_pnl_pct", 0)   # Track highest PnL for cascade triggers
+
+        # ── Cascade pricing reference ──
+        # Per-token entry price used for cascade threshold comparisons.
+        # If absent in data (e.g. stale positions.json), derive from buy_amount_sol/buy_amount_tokens.
+        bppt = data.get("buy_price_per_token")
+        if bppt is None or bppt <= 0:
+            bppt = (self.buy_amount_sol / self.buy_amount_tokens) if self.buy_amount_tokens > 0 else 0
+        self.buy_price_per_token = bppt
+
+        # Pinned DexScreener pair address — keeps PnL math consistent if a higher-liq pair pops up
+        self.pair_address = data.get("pair_address", "")
+
+        # ── Safety baselines (continuous monitoring) ──
+        self.liquidity_at_buy = data.get("liquidity_at_buy", 0)
+        self.holder_snapshot = data.get("holder_snapshot", [])
+        self.last_mint_check_time = data.get("last_mint_check_time", 0)
+        self.last_holder_check_time = data.get("last_holder_check_time", 0)
+
+    def to_dict(self):
+        return {
+            "token_address": self.token_address,
+            "token_symbol": self.token_symbol,
+            "token_name": self.token_name,
+            "buy_amount_sol": self.buy_amount_sol,
+            "buy_amount_tokens": self.buy_amount_tokens,
+            "buy_price_sol": self.buy_price_sol,
+            "buy_time": self.buy_time,
+            "buy_tx": self.buy_tx,
+            "status": self.status,
+            "tokens_remaining": self.tokens_remaining,
+            "total_sold_sol": self.total_sold_sol,
+            "sells": self.sells,
+            "score": self.score,
+            "url": self.url,
+            "cascade_level": self.cascade_level,
+            "peak_pnl_pct": self.peak_pnl_pct,
+            "buy_price_per_token": self.buy_price_per_token,
+            "pair_address": self.pair_address,
+            "liquidity_at_buy": self.liquidity_at_buy,
+            "holder_snapshot": self.holder_snapshot,
+            "last_mint_check_time": self.last_mint_check_time,
+            "last_holder_check_time": self.last_holder_check_time,
+        }
+
+
+class PositionManager:
+    """Manages all open positions."""
+
+    def __init__(self, filepath: str):
+        self.filepath = Path(filepath)
+        self.positions: list[Position] = []
+        self.load()
+
+    def load(self):
+        if self.filepath.exists():
+            try:
+                data = json.loads(self.filepath.read_text(encoding="utf-8"))
+                self.positions = [Position(p) for p in data]
+            except:
+                self.positions = []
+
+    def save(self):
+        """Atomic save — write to .tmp then rename to prevent corruption."""
+        data = [p.to_dict() for p in self.positions]
+        tmp_path = self.filepath.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(str(tmp_path), str(self.filepath))  # Atomic on most OS
+
+    def add(self, position: Position):
+        self.positions.append(position)
+        self.save()
+
+    def get_open(self) -> list[Position]:
+        return [p for p in self.positions if p.status in ("open", "partial")]
+
+    def get_by_address(self, addr: str) -> Optional[Position]:
+        addr_lower = addr.lower()
+        for p in self.positions:
+            if p.token_address.lower() == addr_lower:
+                return p
+        return None
+
+    @property
+    def open_count(self):
+        """Only count positions where investment is still at risk (not yet recovered)."""
+        return len([p for p in self.positions
+                    if p.status in ("open", "partial") and p.cascade_level == 0])
+
+    @property
+    def moonbag_count(self):
+        """Count moonbag positions (investment recovered, riding free)."""
+        return len([p for p in self.positions
+                    if p.status in ("open", "partial") and p.cascade_level >= 1])
+
+
+# ─── TRADE LOG ──────────────────────────────────────────────
+
+class TradeLog:
+    """Append-only NDJSON trade log (one JSON object per line).
+    Avoids the O(n^2) write pattern of rewriting the entire file on every event,
+    which became a real problem once continuous safety checks started logging warnings.
+
+    Backward compatible with the old format (a JSON array): if `trade_log.json`
+    is detected as a single JSON array, it is migrated to NDJSON on first init.
+    """
+
+    def __init__(self, filepath: str):
+        self.filepath = Path(filepath)
+        if self.filepath.exists():
+            self._migrate_if_legacy()
+
+    def _migrate_if_legacy(self):
+        """If file starts with '[', it's the old JSON-array format → rewrite as NDJSON."""
+        try:
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                head = f.read(1)
+            if head != "[":
+                return  # already NDJSON or empty
+            data = json.loads(self.filepath.read_text(encoding="utf-8"))
+            if not isinstance(data, list):
+                return
+            tmp = self.filepath.with_suffix(".migrate.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                for item in data:
+                    f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            os.replace(str(tmp), str(self.filepath))
+            print(f"  📝 Migrated {len(data)} trade-log entries from JSON array → NDJSON")
+        except Exception as e:
+            print(f"  ⚠️  trade_log migration skipped: {e}")
+
+    def log(self, trade: dict):
+        trade["timestamp"] = datetime.now(timezone.utc).isoformat()
+        # Append-only: O(1) per write.
+        with open(self.filepath, "a", encoding="utf-8") as f:
+            f.write(json.dumps(trade, ensure_ascii=False) + "\n")
+
+    def read_all(self) -> list:
+        """Read all events. Used by --status display and dashboard fallback."""
+        if not self.filepath.exists():
+            return []
+        events = []
+        with open(self.filepath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue  # skip corrupt lines
+        return events
+
+    def compact(self, keep_last: int = 5000):
+        """Optional cleanup: keep only the most recent `keep_last` events."""
+        events = self.read_all()
+        if len(events) <= keep_last:
+            return
+        kept = events[-keep_last:]
+        tmp = self.filepath.with_suffix(".compact.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            for ev in kept:
+                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        os.replace(str(tmp), str(self.filepath))
+        print(f"  🗜️  Compacted trade log: kept last {keep_last} of {len(events)} events")
+
+
+# ─── TRADING LOGIC ──────────────────────────────────────────
+
+def execute_buy(wallet: Wallet, token_address: str, amount_sol: float,
+                token_name: str = "?", token_symbol: str = "?",
+                score: int = 0, url: str = "") -> Optional[Position]:
+    """Buy a token."""
+    amount_lamports = int(amount_sol * LAMPORTS_PER_SOL)
+
+    print(f"\n  🛒 BUYING {token_name} (${token_symbol})")
+    print(f"     Amount: {amount_sol} SOL")
+    print(f"     CA: {token_address}")
+
+    # ── SAFETY CHECK (pre-buy, FULL 6-layer gate) ──
+    initial_holder_snapshot = []
+    if SAFETY_AVAILABLE:
+        full_report = run_full_safety_check(token_address)
+        print(summarize_full_report(full_report))
+        initial_holder_snapshot = full_report.get("holder_snapshot", [])
+
+        if not full_report["passed"]:
+            print(f"     ❌ SAFETY CHECK FAILED — blocking: {full_report['blocking_reasons']}")
+            return None
+        print(f"     ✅ Full safety check passed (score: {full_report['score']}/100)")
+    else:
+        print(f"     ⚠️  Safety module not available — buying without checks")
+
+    # ── Capture liquidity baseline from DexScreener ──
+    liquidity_at_buy = 0
+    try:
+        ds = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+            headers={"Accept": "application/json", "User-Agent": "DegenBot/1.0"},
+            timeout=10,
+        )
+        pairs = (ds.json() or {}).get("pairs") or []
+        if pairs:
+            best = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0))
+            liquidity_at_buy = float((best.get("liquidity") or {}).get("usd", 0) or 0)
+            print(f"     💧 Liquidity baseline: ${liquidity_at_buy:.0f}")
+    except Exception as e:
+        print(f"     ⚠️  Could not capture liquidity baseline: {e}")
+
+    now_epoch = time.time()
+
+    if CONFIG["dry_run"]:
+        print(f"     🧪 DRY RUN — symulacja zakupu")
+        sim_tokens = 0
+        sim_price_sol = 0
+        # Try Jupiter first, fall back to DexScreener
+        quote = get_quote(SOL_MINT, token_address, amount_lamports)
+        # Always pull DexScreener pair info — we need to PIN a pair_address regardless of Jupiter
+        ds_price_sol, ds_price_usd, pinned_pair = get_dexscreener_price(token_address)
+        if quote and int(quote.get("outAmount", 0)) > 0:
+            sim_tokens = int(quote["outAmount"])
+            sim_price_sol = amount_sol / sim_tokens * LAMPORTS_PER_SOL
+            print(f"     📊 Jupiter quote: ~{sim_tokens:,} tokens (pinned pair: {pinned_pair[:8] or 'none'}...)")
+        else:
+            # DexScreener fallback — price per token in SOL
+            if ds_price_sol > 0:
+                sim_tokens = int(amount_sol / ds_price_sol)
+                sim_price_sol = ds_price_sol
+                print(f"     📊 DexScreener price: {ds_price_sol:.10f} SOL/token (${ds_price_usd:.8f})")
+                print(f"     📊 Simulated: ~{sim_tokens:,} tokens (pinned pair: {pinned_pair[:8]}...)")
+            else:
+                print(f"     ⚠️  No price data — position will have no tokens to track")
+        pos = Position({
+            "token_address": token_address,
+            "token_symbol": token_symbol,
+            "token_name": token_name,
+            "buy_amount_sol": amount_sol,
+            "buy_amount_tokens": sim_tokens,
+            "buy_price_sol": sim_price_sol,
+            "buy_tx": "DRY_RUN",
+            "status": "open",
+            "tokens_remaining": sim_tokens,
+            "score": score,
+            "url": url,
+            "pair_address": pinned_pair,
+            "liquidity_at_buy": liquidity_at_buy,
+            "holder_snapshot": initial_holder_snapshot,
+            "last_mint_check_time": now_epoch,
+            "last_holder_check_time": now_epoch,
+        })
+        return pos
+
+    # 1. Get quote
+    print(f"     📊 Pobieram quote...")
+    quote = get_quote(SOL_MINT, token_address, amount_lamports)
+    if not quote:
+        print(f"     ❌ Nie udało się pobrać quote")
+        return None
+
+    out_amount = int(quote.get("outAmount", 0))
+    print(f"     📊 Otrzymam ~{out_amount:,} tokenów")
+
+    # 2. Get swap transaction
+    print(f"     🔄 Przygotowuję transakcję...")
+    swap_tx = get_swap_transaction(quote, wallet.public_key)
+    if not swap_tx:
+        print(f"     ❌ Nie udało się przygotować transakcji")
+        return None
+
+    # 3. Sign
+    print(f"     ✍️  Podpisuję...")
+    signed = wallet.sign_transaction(swap_tx)
+    if not signed:
+        return None
+
+    # 4. Send
+    print(f"     📤 Wysyłam transakcję...")
+    signature = send_transaction(signed)
+    if not signature:
+        return None
+
+    print(f"     ✅ TX: {signature}")
+    print(f"     🔗 https://solscan.io/tx/{signature}")
+
+    # Wait a bit for confirmation
+    time.sleep(3)
+
+    # Get actual token balance
+    actual_tokens = get_token_balance(wallet.public_key, token_address)
+
+    # Pin the DexScreener pair for consistent price tracking across cycles
+    _, _, pinned_pair = get_dexscreener_price(token_address)
+
+    pos = Position({
+        "token_address": token_address,
+        "token_symbol": token_symbol,
+        "token_name": token_name,
+        "buy_amount_sol": amount_sol,
+        "buy_amount_tokens": actual_tokens if actual_tokens > 0 else out_amount,
+        "buy_price_sol": amount_sol / out_amount * LAMPORTS_PER_SOL if out_amount > 0 else 0,
+        "buy_tx": signature,
+        "status": "open",
+        "tokens_remaining": actual_tokens if actual_tokens > 0 else out_amount,
+        "score": score,
+        "url": url,
+        "pair_address": pinned_pair,
+        "liquidity_at_buy": liquidity_at_buy,
+        "holder_snapshot": initial_holder_snapshot,
+        "last_mint_check_time": now_epoch,
+        "last_holder_check_time": now_epoch,
+    })
+    return pos
+
+
+def execute_sell(wallet: Wallet, position: Position, sell_pct: float, reason: str = "") -> bool:
+    """Sell a percentage of position. Falls back to selling everything as 'dust'
+    if the requested amount is too small to actually move tokens or is below the
+    fee-recovery threshold."""
+    requested = int(position.tokens_remaining * (sell_pct / 100))
+    tokens_to_sell = requested
+
+    # Estimate current value to decide between "dust → sell all" vs "ensure progress"
+    dust_close = False
+    est_value_sol = 0
+    pinned = getattr(position, "pair_address", "") or ""
+    if position.tokens_remaining > 0:
+        # Use DexScreener (pinned pair) for the value estimate
+        price_sol, _, _ = get_dexscreener_price(position.token_address, pinned)
+        if price_sol > 0:
+            est_value_sol = position.tokens_remaining * price_sol
+
+    # H-5 FIX: handle the silent-fail case where tokens_to_sell rounds to 0
+    if tokens_to_sell <= 0 and position.tokens_remaining > 0 and sell_pct > 0:
+        if est_value_sol > 0 and est_value_sol < 0.001:
+            # Dust position: close it out completely
+            tokens_to_sell = position.tokens_remaining
+            dust_close = True
+            reason = f"DUST close ({reason})"
+            print(f"     🧹 Position is dust ({est_value_sol:.6f} SOL) — selling all remaining")
+        else:
+            # Round-down killed our sell; force at least 1 token to ensure progress
+            tokens_to_sell = max(1, requested)
+            print(f"     🔧 Rounded sell ({requested}) → forcing {tokens_to_sell} token(s) to ensure cascade progress")
+
+    if tokens_to_sell <= 0:
+        # Truly nothing to sell (tokens_remaining itself is 0 or sell_pct is 0)
+        print(f"     ⚠️  Brak tokenów do sprzedania (remaining={position.tokens_remaining}, pct={sell_pct})")
+        return False
+
+    print(f"\n  📤 SELLING {sell_pct:.0f}% of {position.token_name} (${position.token_symbol})")
+    print(f"     Tokens: {tokens_to_sell:,} / {position.tokens_remaining:,}")
+    print(f"     Reason: {reason}")
+
+    if CONFIG["dry_run"]:
+        print(f"     🧪 DRY RUN — symulacja sprzedaży")
+        # Calculate simulated SOL received from DexScreener price (re-fetch for freshness, pinned pair)
+        sim_sol_out = 0
+        price_sol, _, _ = get_dexscreener_price(position.token_address, pinned)
+        if price_sol > 0:
+            sim_sol_out = tokens_to_sell * price_sol
+
+        # SANITY CHECK: any single sell yielding more than 100x the original buy_amount is
+        # almost certainly a data bug (wrong-quote pair, stale dead-pair price, decimals
+        # mismatch). Flag, log loudly, and DO NOT record the bogus value.
+        # Why 100x not 1000x: a cascade sell is at most 12% of remaining tokens; for that
+        # slice alone to exceed 100x the original total investment, the underlying token
+        # would need ~1000x growth. Possible but rare enough that we'd rather skip the
+        # record than poison the trade log with bad data.
+        max_plausible = position.buy_amount_sol * 100.0
+        if sim_sol_out > max_plausible and max_plausible > 0:
+            print(f"     🛑 Implausible sell value {sim_sol_out:.4f} SOL "
+                  f"(>100x buy_amount {position.buy_amount_sol} SOL) — likely bad price data. "
+                  f"Recording 0 received and marking position as 'suspect'.")
+            sim_sol_out = 0
+            position.status = "suspect"
+        # Emergency-sell special case: if the pool is drained (this branch rarely fires now
+        # that get_dexscreener_price filters dead pairs, but defense in depth) we may still
+        # land here with a stale price. Record what we got but cap at buy_amount as a last
+        # resort if it still looks weird.
+        elif "Liquidity dropped" in reason and sim_sol_out > position.buy_amount_sol * 10:
+            print(f"     ⚠️  Emergency sell into drained pool reported {sim_sol_out:.4f} SOL — "
+                  f"capping at 10x buy ({position.buy_amount_sol * 10:.4f} SOL) as defensive estimate")
+            sim_sol_out = position.buy_amount_sol * 10
+        print(f"     📊 Simulated: ~{sim_sol_out:.6f} SOL received")
+        position.tokens_remaining -= tokens_to_sell
+        position.total_sold_sol += sim_sol_out
+        if position.tokens_remaining <= 0 or dust_close:
+            position.status = "dust" if dust_close else "closed"
+            position.tokens_remaining = 0
+        else:
+            position.status = "partial"
+        position.sells.append({
+            "pct": sell_pct, "tokens": tokens_to_sell,
+            "sol_received": sim_sol_out, "reason": reason,
+            "tx": "DRY_RUN",
+            "time": datetime.now(timezone.utc).isoformat(),
+        })
+        return True
+
+    # 1. Quote
+    quote = get_quote(position.token_address, SOL_MINT, tokens_to_sell)
+    if not quote:
+        print(f"     ❌ Nie udało się pobrać quote sell")
+        return False
+
+    sol_out = int(quote.get("outAmount", 0)) / LAMPORTS_PER_SOL
+    print(f"     📊 Otrzymam ~{sol_out:.4f} SOL")
+
+    # SANITY CHECK (live): if Jupiter quote claims >100x the original buy, refuse to send.
+    # Either the route is malicious/wrong or there's a decoding bug. Never trade on data we don't trust.
+    # 100x is already an exceptional outcome for a single cascade slice; anything larger is a smell.
+    if sol_out > position.buy_amount_sol * 100.0 and position.buy_amount_sol > 0:
+        print(f"     🛑 ABORTING SELL: quote {sol_out:.4f} SOL > 100x buy_amount "
+              f"({position.buy_amount_sol} SOL). Refusing to trade on suspect quote.")
+        return False
+
+    # 2. Swap tx
+    swap_tx = get_swap_transaction(quote, wallet.public_key)
+    if not swap_tx:
+        return False
+
+    # 3. Sign + send
+    signed = wallet.sign_transaction(swap_tx)
+    if not signed:
+        return False
+
+    signature = send_transaction(signed)
+    if not signature:
+        return False
+
+    print(f"     ✅ SOLD! TX: {signature}")
+    print(f"     💰 Received: {sol_out:.4f} SOL")
+
+    # Update position
+    position.tokens_remaining -= tokens_to_sell
+    position.total_sold_sol += sol_out
+    if position.tokens_remaining <= 0 or dust_close:
+        position.status = "dust" if dust_close else "closed"
+        position.tokens_remaining = 0
+    else:
+        position.status = "partial"
+
+    position.sells.append({
+        "pct": sell_pct, "tokens": tokens_to_sell,
+        "sol_received": sol_out, "reason": reason,
+        "tx": signature,
+        "time": datetime.now(timezone.utc).isoformat(),
+    })
+
+    return True
+
+
+# ─── POSITION MONITOR ───────────────────────────────────────
+
+def _next_cascade_threshold(c: dict, current_level: int) -> float:
+    """Compute the PnL% threshold that triggers the NEXT cascade,
+    given that `current_level` TPs have already fired.
+
+    Schedule (with defaults):
+      level 0 → TP1 fires at +30% (recover investment)
+      level 1 → TP2 fires at +60%  (+30% interval — early)
+      level 2 → TP3 fires at +90%  (+30% interval — early)
+      level 3 → TP4 fires at +140% (+50% interval — late)
+      level 4 → TP5 fires at +190% (+50% interval — late)
+      level N≥3 → next TP fires +50% above previous
+
+    The interval used to compute TP_(i+1) depends on the level we are
+    transitioning FROM (i). If i <= cascade_widen_after_level, use the
+    early interval; otherwise the late one.
+    """
+    threshold = c["take_profit_pct"]  # TP1 anchor (percentage, e.g. 30)
+    widen_after = c.get("cascade_widen_after_level", 2)
+    early = c.get("early_cascade_interval", 0.30) * 100
+    late = c.get("late_cascade_interval", 0.50) * 100
+
+    # Walk from TP1 up to TP(current_level+1), adding the right interval each step.
+    # When computing TP_(i+1), the relevant transition is FROM level i.
+    for from_level in range(1, current_level + 1):
+        threshold += early if from_level <= widen_after else late
+    return threshold
+
+
+def check_positions(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
+    """Check all open positions and execute TP/SL."""
+    open_positions = pm.get_open()
+    if not open_positions:
+        return
+
+    c = CONFIG
+    print(f"\n  📊 Sprawdzam {len(open_positions)} pozycji...")
+
+    for pos in open_positions:
+        # Get current value of remaining tokens in SOL
+        if pos.tokens_remaining <= 0:
+            pos.status = "closed"
+            pm.save()
+            continue
+
+        # ── CONTINUOUS SAFETY CHECKS (per cycle) ──
+        if SAFETY_AVAILABLE:
+            try:
+                now_epoch = time.time()
+                mint_interval = NEW_SAFETY_CONFIG["mint_recheck_interval_sec"]
+                do_mint = (now_epoch - getattr(pos, "last_mint_check_time", 0)) >= mint_interval
+                cont = run_continuous_safety_checks(
+                    pos.token_address,
+                    baseline_liquidity_usd=getattr(pos, "liquidity_at_buy", 0),
+                    prev_holder_snapshot=getattr(pos, "holder_snapshot", []),
+                    do_mint_recheck=do_mint,
+                    rpc_url=CONFIG["rpc_url"],
+                )
+
+                # Persist updated holder snapshot + mint check timestamp
+                if cont["new_holder_snapshot"]:
+                    pos.holder_snapshot = cont["new_holder_snapshot"]
+                    pos.last_holder_check_time = now_epoch
+                if do_mint and cont.get("mint") is not None:
+                    pos.last_mint_check_time = now_epoch
+
+                # Log warnings
+                for w in cont.get("warnings", []):
+                    print(f"     {w}")
+                    log_safety_event(trade_log, "warning", pos, {"message": w})
+
+                # Emergency sell trigger
+                if cont["emergency_sell"]:
+                    reasons = " | ".join(cont["emergency_reasons"])
+                    print(f"\n  🚨 EMERGENCY SAFETY TRIGGER for {pos.token_symbol}: {reasons}")
+                    log_safety_event(trade_log, "emergency_sell_trigger", pos, {
+                        "reasons": cont["emergency_reasons"],
+                        "liquidity": cont.get("liquidity"),
+                        "mint": cont.get("mint"),
+                    })
+                    if execute_sell(wallet, pos, 100, f"EMERGENCY: {reasons[:80]}"):
+                        trade_log.log({
+                            "action": "emergency_sell",
+                            "token": pos.token_symbol,
+                            "reasons": cont["emergency_reasons"],
+                        })
+                        pm.save()
+                    continue  # Skip TP/SL evaluation — position is closing
+            except Exception as e:
+                print(f"     ⚠️  Continuous safety check error for {pos.token_symbol}: {e}")
+
+        current_value_sol = 0
+        if CONFIG["dry_run"]:
+            # Dry-run: use DexScreener price on the pinned pair (consistent across cycles).
+            # If pinned pair died, get_dexscreener_price falls back to highest-liq pair.
+            pinned = getattr(pos, "pair_address", "") or ""
+            price_sol, _, used_pair = get_dexscreener_price(pos.token_address, pinned)
+            if price_sol <= 0:
+                print(f"     ⚠️  {pos.token_name}: no price data, skipping")
+                pm.save()  # persist any safety-check timestamps
+                continue
+            # If we fell back to a different pair (pinned died), update the pin
+            if pinned and used_pair and used_pair != pinned:
+                print(f"     🔁 {pos.token_name}: pinned pair {pinned[:8]}... dead, switched to {used_pair[:8]}...")
+                pos.pair_address = used_pair
+            current_value_sol = pos.tokens_remaining * price_sol
+        else:
+            quote = get_quote(pos.token_address, SOL_MINT, pos.tokens_remaining, slippage_bps=100)
+            if not quote:
+                pm.save()  # persist any safety-check timestamps
+                continue
+            current_value_sol = int(quote.get("outAmount", 0)) / LAMPORTS_PER_SOL
+
+        # PnL on the *remaining bag* against original investment (used for stop-loss + display only).
+        pnl_pct = ((current_value_sol - pos.buy_amount_sol) / pos.buy_amount_sol * 100) if pos.buy_amount_sol > 0 else 0
+
+        # ── DUST AUTO-CLOSE (moonbags only) ──
+        # A moonbag that decayed below 0.001 SOL is worth less than fees. Close it so it stops
+        # cluttering the dashboard and gets monitored in `closed/dust` view instead.
+        DUST_THRESHOLD_SOL = 0.001
+        if pos.cascade_level > 0 and 0 < current_value_sol < DUST_THRESHOLD_SOL:
+            print(f"     🧹 {pos.token_name}: moonbag value {current_value_sol:.6f} SOL < {DUST_THRESHOLD_SOL} — auto-close as dust")
+            pos.status = "dust"
+            pos.tokens_remaining = 0
+            trade_log.log({
+                "action": "dust_close",
+                "token": pos.token_symbol,
+                "token_address": pos.token_address,
+                "value_at_close_sol": current_value_sol,
+                "cascade_level": pos.cascade_level,
+                "reason": "moonbag dust",
+            })
+            pm.save()
+            continue  # nothing more to evaluate for this position
+
+        # Per-token price change since buy (used for cascade thresholds).
+        # This is the right metric: "TP2 at +60%" must mean price is 60% above buy, regardless of how
+        # many tokens we already sold.
+        if pos.tokens_remaining > 0 and pos.buy_price_per_token > 0:
+            current_price_per_token = current_value_sol / pos.tokens_remaining
+            price_change_pct = (current_price_per_token - pos.buy_price_per_token) / pos.buy_price_per_token * 100
+        else:
+            current_price_per_token = 0
+            price_change_pct = pnl_pct  # fallback when we have no per-token reference
+
+        # Display
+        emoji = "🟢" if pnl_pct >= 0 else "🔴"
+        print(f"     {emoji} {pos.token_name} (${pos.token_symbol}): "
+              f"price {price_change_pct:+.1f}% | bag PnL {pnl_pct:+.1f}% | "
+              f"Value: {current_value_sol:.4f} SOL | Paid: {pos.buy_amount_sol:.4f} SOL")
+
+        # ── CASCADING TAKE PROFIT (price-based thresholds) ──
+
+        # Level 0: First TP — recover investment when PRICE is up >= take_profit_pct.
+        if price_change_pct >= c["take_profit_pct"] and pos.cascade_level == 0:
+            # Sell enough of the remaining bag to recover the original SOL investment.
+            tokens_for_investment = pos.tokens_remaining * (pos.buy_amount_sol / current_value_sol)
+            sell_pct = min(95, (tokens_for_investment / pos.tokens_remaining) * 100)
+
+            print(f"     🎯 TAKE PROFIT #1! Price +{price_change_pct:.0f}% — selling {sell_pct:.0f}% to recover investment")
+            if execute_sell(wallet, pos, sell_pct, f"TP1: recover investment at price +{price_change_pct:.0f}%"):
+                pos.cascade_level = 1
+                pos.peak_pnl_pct = max(pos.peak_pnl_pct, pnl_pct)
+                trade_log.log({
+                    "action": "cascade_tp", "level": 1,
+                    "token": pos.token_symbol,
+                    "price_change_pct": price_change_pct,
+                    "pnl_pct": pnl_pct,
+                    "sell_pct": sell_pct,
+                })
+                pm.save()
+
+        # Level 1+: Cascade based on PRICE change schedule (30% early, 50% late, 12% of remaining).
+        elif pos.cascade_level >= 1 and pos.tokens_remaining > 0:
+            next_cascade_pct = _next_cascade_threshold(c, pos.cascade_level)
+
+            if price_change_pct >= next_cascade_pct:
+                min_val = c.get("min_moonbag_value_sol", 0.005)
+                if current_value_sol < min_val:
+                    print(f"     💤 Moonbag value ({current_value_sol:.4f} SOL) below min ({min_val} SOL) — holding")
+                else:
+                    sell_pct = c["moonbag_sell_pct"] * 100  # fraction → percentage
+                    next_level = pos.cascade_level + 1
+                    print(f"     🚀 CASCADE #{next_level}! Price +{price_change_pct:.0f}% (threshold +{next_cascade_pct:.0f}%) — selling {sell_pct:.0f}% of remaining")
+                    if execute_sell(wallet, pos, sell_pct, f"Cascade #{next_level} at price +{price_change_pct:.0f}%"):
+                        pos.cascade_level = next_level
+                        pos.peak_pnl_pct = max(pos.peak_pnl_pct, pnl_pct)
+                        trade_log.log({
+                            "action": "cascade_tp", "level": next_level,
+                            "token": pos.token_symbol,
+                            "price_change_pct": price_change_pct,
+                            "pnl_pct": pnl_pct,
+                            "sell_pct": sell_pct,
+                            "threshold_pct": next_cascade_pct,
+                        })
+                        pm.save()
+
+        # ── STOP LOSS (still PnL-based, only active before TP1) ──
+        if pnl_pct <= c["stop_loss_pct"] and pos.cascade_level == 0:
+            print(f"     🛑 STOP LOSS! Bag PnL {pnl_pct:.0f}% — selling everything")
+            if execute_sell(wallet, pos, 100, f"SL at PnL {pnl_pct:.0f}%"):
+                trade_log.log({
+                    "action": "stop_loss", "token": pos.token_symbol,
+                    "pnl_pct": pnl_pct,
+                    "price_change_pct": price_change_pct,
+                })
+                pm.save()
+
+        # After investment recovered (cascade_level >= 1), NO stop loss
+        # Moonbag rides to 0 or moon — it's free money
+
+        time.sleep(1)  # Rate limit
+
+
+# ─── SNIPER INTEGRATION ─────────────────────────────────────
+
+def _save_processed_alerts(processed_file: Path, processed: set):
+    """Atomically persist the processed-alerts marker file."""
+    tmp = processed_file.with_suffix(".tmp")
+    tmp.write_text(json.dumps(sorted(processed)), encoding="utf-8")
+    os.replace(str(tmp), str(processed_file))
+
+
+def process_sniper_alerts(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
+    """Check for new sniper alerts and auto-buy."""
+    alert_dir = Path("sniper_alerts")
+    if not alert_dir.exists():
+        return
+
+    processed_file = Path("processed_alerts.json")
+    processed = set()
+    if processed_file.exists():
+        try:
+            processed = set(json.loads(processed_file.read_text()))
+        except Exception:
+            pass
+
+    for alert_file in sorted(alert_dir.glob("alert_*.json")):
+        fname = alert_file.name
+        # Skip in-flight writes from the sniper (atomic-write .tmp companions).
+        if fname.endswith(".tmp"):
+            continue
+        if fname in processed:
+            continue
+
+        try:
+            data = json.loads(alert_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            # Don't mark as processed — most likely a partial write; retry next cycle.
+            print(f"     ⚠️  Could not parse {fname} ({e}); will retry next cycle")
+            continue
+
+        try:
+            detections = data.get("detections", [])
+
+            for det in detections:
+                token_addr = det.get("token_address", "")
+                score = det.get("score", 0)
+                signal = det.get("signal", "")
+
+                # Skip if already have position
+                if pm.get_by_address(token_addr):
+                    continue
+
+                # Skip if too many ACTIVE positions (moonbags don't count)
+                if pm.open_count >= CONFIG["max_positions"]:
+                    print(f"     ⚠️  Max aktywnych pozycji ({CONFIG['max_positions']}). Moonbagi: {pm.moonbag_count}. Pomijam.")
+                    continue
+
+                # Skip if score too low
+                if score < CONFIG["min_score_to_buy"]:
+                    continue
+
+                # BUY!
+                pos = execute_buy(
+                    wallet, token_addr, CONFIG["buy_amount_sol"],
+                    token_name=det.get("token_name", "?"),
+                    token_symbol=det.get("token_symbol", "?"),
+                    score=score,
+                    url=det.get("url", ""),
+                )
+
+                if pos:
+                    pm.add(pos)
+                    trade_log.log({
+                        "action": "buy", "token": pos.token_symbol,
+                        "amount_sol": pos.buy_amount_sol,
+                        "score": score, "signal": signal,
+                    })
+                    print(f"     ✅ Pozycja otwarta!")
+
+                time.sleep(2)
+
+            # Mark processed only AFTER successful processing of this file.
+            processed.add(fname)
+            # Persist the marker per-file so a mid-loop crash doesn't lose progress.
+            _save_processed_alerts(processed_file, processed)
+        except Exception as e:
+            # Iteration over detections failed for some other reason (e.g. RPC error).
+            # Don't mark as processed — retry next cycle.
+            print(f"     ❌ Error processing {fname}: {e} — will retry next cycle")
+
+
+# ─── STATUS DISPLAY ─────────────────────────────────────────
+
+def show_status(wallet: Optional[Wallet], pm: PositionManager):
+    """Display current status."""
+    print()
+    print("  ╔═══════════════════════════════════════════╗")
+    print("  ║   🤖 DEGEN BOT — Status                  ║")
+    print("  ╚═══════════════════════════════════════════╝")
+    print()
+
+    if wallet and wallet.ready:
+        balance = get_sol_balance(wallet.public_key)
+        print(f"  💳 Wallet: {wallet.public_key[:8]}...{wallet.public_key[-6:]}")
+        print(f"  💰 Balance: {balance:.4f} SOL")
+    else:
+        print(f"  ⚠️  Wallet nie skonfigurowany")
+
+    open_pos = pm.get_open()
+    active = [p for p in open_pos if p.cascade_level == 0]
+    moonbags = [p for p in open_pos if p.cascade_level >= 1]
+    closed = [p for p in pm.positions if p.status in ("closed", "stopped")]
+
+    print(f"\n  📊 Pozycje: {len(active)} active (at risk) | {len(moonbags)} moonbags (free) | {len(closed)} closed")
+    print(f"  🎯 Strategy: TP +{CONFIG['take_profit_pct']}% → recover investment → cascade {CONFIG['cascade_sell_pct']}% every +{CONFIG['cascade_interval_pct']}% | SL {CONFIG['stop_loss_pct']}%")
+    print(f"  💵 Buy size: {CONFIG['buy_amount_sol']} SOL per token")
+    print(f"  📊 Min score: {CONFIG['min_score_to_buy']}+")
+    print(f"  {'🧪 DRY RUN MODE' if CONFIG['dry_run'] else '🔴 LIVE MODE — Real money!'}")
+    print()
+
+    if open_pos:
+        print("  ── Open Positions ──")
+        for p in open_pos:
+            age = ""
+            try:
+                dt = datetime.fromisoformat(p.buy_time.replace('Z', '+00:00'))
+                hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+                age = f"{hours:.0f}h"
+            except:
+                pass
+
+            pnl_label = ""
+            if p.total_sold_sol > 0:
+                pnl_label = f" | Sold: {p.total_sold_sol:.4f} SOL"
+
+            print(f"     {'🟢' if p.status == 'open' else '🟡'} {p.token_name} (${p.token_symbol}) "
+                  f"| Bought: {p.buy_amount_sol} SOL | Score: {p.score} "
+                  f"| Age: {age} | Status: {p.status} | Cascade: {p.cascade_level}{pnl_label}")
+        print()
+
+    if closed:
+        print("  ── Closed Positions ──")
+        total_invested = 0
+        total_returned = 0
+        for p in closed:
+            total_invested += p.buy_amount_sol
+            total_returned += p.total_sold_sol
+            pnl = p.total_sold_sol - p.buy_amount_sol
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            print(f"     {emoji} {p.token_name} | In: {p.buy_amount_sol} SOL | Out: {p.total_sold_sol:.4f} SOL | PnL: {pnl:+.4f} SOL")
+
+        total_pnl = total_returned - total_invested
+        print(f"\n     📊 Total: Invested {total_invested:.4f} SOL | Returned {total_returned:.4f} SOL | PnL: {total_pnl:+.4f} SOL")
+        print()
+
+
+# ─── MAIN ───────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+
+    # Parse flags
+    if "--dry-run" in args:
+        CONFIG["dry_run"] = True
+        args = [a for a in args if a != "--dry-run"]
+
+    if "--live" in args:
+        CONFIG["dry_run"] = False
+        args = [a for a in args if a != "--live"]
+
+    pm = PositionManager(CONFIG["positions_file"])
+    trade_log = TradeLog(CONFIG["trade_log_file"])
+    wallet = load_wallet()
+
+    # ── STATUS ──
+    if "--status" in args:
+        show_status(wallet, pm)
+        return
+
+    # ── MANUAL BUY ──
+    if "--buy" in args:
+        idx = args.index("--buy")
+        if idx + 2 >= len(args):
+            print("  Usage: --buy <CA> <amount_sol>")
+            return
+        token_addr = args[idx + 1]
+        amount_sol = float(args[idx + 2])
+
+        if not wallet or not wallet.ready:
+            print("  ❌ Wallet nie skonfigurowany!")
+            return
+
+        pos = execute_buy(wallet, token_addr, amount_sol)
+        if pos:
+            pm.add(pos)
+            trade_log.log({"action": "manual_buy", "token": pos.token_symbol, "amount_sol": amount_sol})
+            print("  ✅ Zakup wykonany!")
+        return
+
+    # ── MANUAL SELL ──
+    if "--sell" in args:
+        idx = args.index("--sell")
+        if idx + 2 >= len(args):
+            print("  Usage: --sell <CA> <percentage>")
+            return
+        token_addr = args[idx + 1]
+        sell_pct = float(args[idx + 2])
+
+        if not wallet or not wallet.ready:
+            print("  ❌ Wallet nie skonfigurowany!")
+            return
+
+        pos = pm.get_by_address(token_addr)
+        if not pos:
+            print(f"  ❌ Nie znaleziono pozycji dla {token_addr}")
+            return
+
+        if execute_sell(wallet, pos, sell_pct, "Manual sell"):
+            pm.save()
+            trade_log.log({"action": "manual_sell", "token": pos.token_symbol, "sell_pct": sell_pct})
+            print("  ✅ Sprzedaż wykonana!")
+        return
+
+    # ── WITHDRAW SOL ──
+    if "--withdraw" in args:
+        idx = args.index("--withdraw")
+        if idx + 1 >= len(args):
+            print("  Usage: --withdraw <TWOJ_ADRES_PHANTOM>")
+            print("  Wyśle cały SOL (minus fee) na podany adres.")
+            return
+
+        dest_address = args[idx + 1]
+
+        if not wallet or not wallet.ready:
+            print("  ❌ Wallet nie skonfigurowany!")
+            return
+
+        balance = get_sol_balance(wallet.public_key)
+        # Zostaw 0.002 SOL na fee
+        send_amount = balance - 0.002
+        if send_amount <= 0:
+            print(f"  ❌ Za mało SOL. Balance: {balance:.4f} SOL")
+            return
+
+        print(f"\n  💸 WITHDRAW")
+        print(f"     From:   {wallet.public_key}")
+        print(f"     To:     {dest_address}")
+        print(f"     Amount: {send_amount:.4f} SOL (keeping 0.002 for fee)")
+        print(f"     Balance: {balance:.4f} SOL")
+
+        if CONFIG["dry_run"]:
+            print(f"     🧪 DRY RUN — nie wysłano")
+            return
+
+        try:
+            from solders.system_program import TransferParams, transfer
+            from solders.transaction import Transaction
+            from solders.pubkey import Pubkey
+            from solders.hash import Hash
+            import base58
+
+            # Get recent blockhash
+            bh_resp = requests.post(CONFIG["rpc_url"], json={
+                "jsonrpc": "2.0", "id": 1,
+                "method": "getLatestBlockhash",
+                "params": [{"commitment": "finalized"}]
+            }, timeout=10).json()
+
+            blockhash_str = bh_resp["result"]["value"]["blockhash"]
+            blockhash = Hash.from_string(blockhash_str)
+
+            # Build transfer instruction
+            ix = transfer(TransferParams(
+                from_pubkey=wallet.keypair.pubkey(),
+                to_pubkey=Pubkey.from_string(dest_address),
+                lamports=int(send_amount * LAMPORTS_PER_SOL),
+            ))
+
+            # Build and sign transaction
+            tx = Transaction.new_signed_with_payer(
+                [ix], wallet.keypair.pubkey(), [wallet.keypair], blockhash
+            )
+
+            # Send
+            tx_b64 = base64.b64encode(bytes(tx)).decode('utf-8')
+            signature = send_transaction(tx_b64)
+
+            if signature:
+                print(f"     ✅ Wysłano! TX: {signature}")
+                print(f"     🔗 https://solscan.io/tx/{signature}")
+                trade_log.log({
+                    "action": "withdraw", "amount_sol": send_amount,
+                    "to": dest_address, "tx": signature,
+                })
+            else:
+                print(f"     ❌ Transakcja nie powiodła się")
+        except ImportError:
+            print(f"     ❌ Potrzebujesz: pip install solana solders base58")
+        except Exception as e:
+            print(f"     ❌ Błąd: {e}")
+        return
+
+    # ── AUTO MODE ──
+    print()
+    print("  ╔═══════════════════════════════════════════╗")
+    print("  ║   🤖 SOLANA DEGEN TRADING BOT            ║")
+    print("  ║   Auto-buy from Liftoff Sniper           ║")
+    print("  ╚═══════════════════════════════════════════╝")
+    print()
+
+    if CONFIG["dry_run"]:
+        print("  🧪 DRY RUN MODE — żadne prawdziwe transakcje nie zostaną wykonane")
+    else:
+        print("  🔴 LIVE MODE — bot będzie wykonywał prawdziwe transakcje!")
+        print("  ⚠️  Upewnij się że wallet ma niewielką ilość SOL")
+
+    if not wallet or not wallet.ready:
+        if not CONFIG["dry_run"]:
+            print("\n  ❌ Wallet nie skonfigurowany!")
+            print("  Ustaw zmienną środowiskową SOL_PRIVATE_KEY")
+            print("  lub stwórz plik bot_wallet.key z private key (base58)")
+            print("\n  Aby wygenerować nowy wallet:")
+            print("    python -c \"from solders.keypair import Keypair; import base58; kp=Keypair(); print('Public:', kp.pubkey()); print('Private:', base58.b58encode(bytes(kp)).decode())\"")
+            return
+        else:
+            print("  ℹ️  Wallet nie skonfigurowany — dry-run bez portfela")
+            wallet = None
+
+    if wallet and wallet.ready:
+        show_status(wallet, pm)
+
+    print(f"  🚀 Startuje auto-mode. Ctrl+C aby zatrzymać.")
+    print(f"  📂 Czekam na alerty z Liftoff Sniper w sniper_alerts/")
+    print()
+
+    try:
+        cycle = 0
+        while True:
+            cycle += 1
+            now = datetime.now().strftime("%H:%M:%S")
+            print(f"  [{now}] Cykl #{cycle}")
+
+            # 1. Process new sniper alerts
+            process_sniper_alerts(wallet, pm, trade_log)
+
+            # 2. Check existing positions for TP/SL
+            check_positions(wallet, pm, trade_log)
+
+            # 3. Auto-sweep profits to cold wallet (every 10 cycles)
+            if SAFETY_AVAILABLE and wallet and cycle % 10 == 0:
+                try:
+                    sig = check_and_sweep(wallet.public_key, wallet.keypair, CONFIG["rpc_url"])
+                    if sig:
+                        trade_log.log({"action": "auto_sweep", "tx": sig})
+                except Exception as e:
+                    print(f"  ⚠️  Sweep error: {e}")
+
+            # Wait
+            interval = CONFIG["price_check_interval"]
+            print(f"  ⏳ Następny check za {interval}s...\n")
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        print(f"\n\n  👋 Bot zatrzymany.")
+        if wallet and wallet.ready:
+            show_status(wallet, pm)
+
+
+if __name__ == "__main__":
+    main()

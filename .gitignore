@@ -1,0 +1,67 @@
+# ─── Secrets / wallets ─────────────────────────────────────
+# NEVER commit private keys. The bot reads its keypair from this file in base58.
+bot_wallet.key
+*.key
+
+# Environment files holding API keys, RPC endpoints, etc.
+.env
+.env.*
+!.env.example
+
+# ─── Local runtime state (per-machine, not source) ─────────
+positions.json
+positions.tmp
+trade_log.json
+trade_log.ndjson
+trade_log.tmp
+trade_log.migrate.tmp
+trade_log.compact.tmp
+processed_alerts.json
+processed_alerts.tmp
+
+# SQLite history DB + WAL/SHM sidecars
+scanner_history.db
+scanner_history.db-wal
+scanner_history.db-shm
+
+# Sniper alert spool (file-based IPC between sniper → trading bot)
+sniper_alerts/
+sniper_log.txt
+
+# Daily scan reports
+reports/
+
+# ─── Python build artifacts ────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE / editor metadata
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Test scratch files
+_phase*_check.py
+_test_*.py
+_purge_*.py
+_realistic_*.py
+
+# ─── Platform-specific ─────────────────────────────────────
+# Windows-only launcher (won't run on Linux deployment target)
+run_dryrun.bat
+
+# ─── Claude Code metadata (local tooling, not source) ──────
+# Project docs for the Claude Code agent — also contains personal info
+CLAUDE.md
+# Claude Code's per-project settings (tool permissions, etc.)
+.claude/
