@@ -89,9 +89,33 @@ Before flipping `--live`, audit the open items tracked in conversation history:
   call's `outAmount` as proof of execution)
 - File locking on `positions.json` / `trade_log.ndjson` (or migrate state to SQLite)
 - Crash-recovery mid-sell: write a `pending_sell` marker before `send_transaction`
-- Remove all `.lower()` calls on Solana token addresses (base58 is case-sensitive)
 - Reconcile any historical positions whose `total_sold_sol` was clamped by the
   sanity cap — those are estimates, not real outcomes
+
+## Backups
+
+`backup_data.sh` copies the live state files into a dated subdirectory under
+`backups/` and prunes anything older than 14 days. It is safe to run while the
+bot and sniper are running — each file is a single `cp`, and missing files are
+simply skipped (and noted in `backups/backup.log`).
+
+Files backed up:
+
+- `positions.json`
+- `trade_log.ndjson` (or `trade_log.json` if the NDJSON migration has not run yet)
+- `processed_alerts.json`
+- `scanner_history.db`
+
+### Adding to cron (server-side)
+
+Edit the crontab with `crontab -e` and add:
+
+```cron
+0 3 * * * /home/ubuntu/gem-scanner/backup_data.sh
+```
+
+This runs the backup nightly at 03:00 local time. Verify it ran with
+`tail backups/backup.log` the next morning.
 
 ## Files / layout
 
@@ -102,6 +126,7 @@ trading_bot.py          — auto-trader (sniper_alerts/ → Jupiter → position
 safety_module.py        — 6-layer pre-buy safety gate + continuous safety checks
 dashboard_local.py      — local web UI on :8420
 db.py                   — SQLite helpers for scanner_history.db
+backup_data.sh          — nightly snapshot of state files → backups/YYYY-MM-DD/
 .env.example            — environment variable template
 requirements.txt        — pinned Python dependencies
 ```

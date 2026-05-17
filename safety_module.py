@@ -317,12 +317,11 @@ def _parse_rugcheck_report(data: dict, result: dict):
         for h in top_holders[:10]:
             if isinstance(h, dict):
                 pct = h.get("pct", h.get("percentage", 0))
-                # Skip known LP/burn addresses
-                addr = h.get("address", "").lower()
-                is_system = any(x in addr for x in [
-                    "1111111111111",  # Burn address
-                    "5q544fkrfoe",    # Raydium LP
-                ])
+                # Skip known LP/burn addresses (Solana base58 — case-sensitive)
+                addr = h.get("address", "")
+                is_system = "1111111111111" in addr  # Burn address (all digits)
+                # Owner is a protocol label (e.g. "Raydium AMM"), not an address —
+                # case-insensitive substring match is appropriate here.
                 owner = (h.get("owner", "") or "").lower()
                 is_lp = "raydium" in owner or "orca" in owner or "burn" in owner
 
@@ -702,9 +701,9 @@ def _is_dead_address(addr: str) -> bool:
     # Heuristic: pure '1's address (Solana null-like)
     if addr.startswith("1111111111") and len(addr) >= 32:
         return True
-    # Common burn patterns
-    al = addr.lower()
-    if "burn" in al or "dead" in al or "incinerator" in al:
+    # Common vanity-burn patterns. Solana base58 is case-sensitive; check the
+    # raw address (vanity addresses typically use lowercase letters here).
+    if "burn" in addr or "dead" in addr or "incinerator" in addr:
         return True
     return False
 

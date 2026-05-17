@@ -531,9 +531,9 @@ class PositionManager:
         return [p for p in self.positions if p.status in ("open", "partial")]
 
     def get_by_address(self, addr: str) -> Optional[Position]:
-        addr_lower = addr.lower()
+        # CASE-SENSITIVE: Solana addresses are base58, case matters.
         for p in self.positions:
-            if p.token_address.lower() == addr_lower:
+            if p.token_address == addr:
                 return p
         return None
 
@@ -1123,6 +1123,20 @@ def check_positions(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
 
 # ─── SNIPER INTEGRATION ─────────────────────────────────────
 
+def compute_cycle_interval(open_count: int) -> int:
+    """Choose cycle interval based on active position count.
+
+    0 positions:    30s  — only checking for alerts, no need to spin fast
+    1-5 positions:  15s  — faster TP/SL reaction while load is manageable
+    6+ positions:   30s  — back off to avoid Jupiter/DexScreener rate limits
+    """
+    if open_count == 0:
+        return 30
+    if open_count <= 5:
+        return 15
+    return 30
+
+
 def _save_processed_alerts(processed_file: Path, processed: set):
     """Atomically persist the processed-alerts marker file."""
     tmp = processed_file.with_suffix(".tmp")
@@ -1167,8 +1181,21 @@ def process_sniper_alerts(wallet: Wallet, pm: PositionManager, trade_log: TradeL
                 score = det.get("score", 0)
                 signal = det.get("signal", "")
 
-                # Skip if already have position
-                if pm.get_by_address(token_addr):
+                # Skip if already have position (case-sensitive — Solana base58)
+                existing = pm.get_by_address(token_addr)
+                if existing:
+                    print(f"     ⏭️  Skipping duplicate {det.get('token_symbol', '?')} "
+                          f"({token_addr[:8]}...) — already have position "
+                          f"(status={existing.status}, new alert score={score})")
+                    trade_log.log({
+                        "action": "skipped_duplicate",
+                        "token": det.get("token_symbol", "?"),
+                        "token_address": token_addr,
+                        "existing_status": existing.status,
+                        "existing_cascade_level": existing.cascade_level,
+                        "new_alert_score": score,
+                        "signal": signal,
+                    })
                     continue
 
                 # Skip if too many ACTIVE positions (moonbags don't count)
@@ -1476,9 +1503,10 @@ def main():
                 except Exception as e:
                     print(f"  ⚠️  Sweep error: {e}")
 
-            # Wait
-            interval = CONFIG["price_check_interval"]
-            print(f"  ⏳ Następny check za {interval}s...\n")
+            # Wait — interval scales with open-position count.
+            open_count = len(pm.get_open())
+            interval = compute_cycle_interval(open_count)
+            print(f"  ⏳ Następny check za {interval}s (open positions: {open_count})...\n")
             time.sleep(interval)
 
     except KeyboardInterrupt:
