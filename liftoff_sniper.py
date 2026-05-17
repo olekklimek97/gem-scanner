@@ -38,13 +38,14 @@ CONFIG = {
     "min_fdv": 5_000,                 # Min FDV
     "min_liquidity": 2_000,           # Min płynność
     "max_pair_age_hours": 48,         # Max wiek pary
+    "min_pair_age_hours": 2,          # Min wiek — 2h (większość rugów w pierwszych 1-2h)
 
     # Price momentum
     "min_price_change_5m": 5,         # Min +5% w 5 min
     "min_price_change_1h": 20,        # Min +20% w 1h
 
     # Alert cooldown — nie powtarzaj alertu dla tego samego tokena
-    "alert_cooldown_minutes": 30,
+    "alert_cooldown_minutes": 90,
 
     # Output
     "top_n": 5,
@@ -133,7 +134,8 @@ def get_boosted_tokens():
     data = api_get("/token-boosts/top/v1")
     if not data:
         return set()
-    return {t.get("tokenAddress", "").lower()
+    # Solana addresses are base58 — keep original case.
+    return {t.get("tokenAddress", "")
             for t in data if t.get("chainId") == "solana"}
 
 
@@ -145,7 +147,7 @@ def get_profiles():
     profiles = {}
     for p in data:
         if p.get("chainId") == "solana":
-            addr = p.get("tokenAddress", "").lower()
+            addr = p.get("tokenAddress", "")
             links = p.get("links") or []
             profiles[addr] = {
                 "has_website": any(l.get("type") == "website" for l in links),
@@ -197,7 +199,7 @@ def detect_liftoff(pair, boosted, profiles):
         return None
 
     base = pair.get("baseToken", {})
-    token_addr = base.get("address", "").lower()
+    token_addr = base.get("address", "")
     token_name = base.get("name", "?")
     token_symbol = base.get("symbol", "?")
     pair_addr = pair.get("pairAddress", "")
@@ -252,6 +254,8 @@ def detect_liftoff(pair, boosted, profiles):
         return None
     if pair_age_hours > c["max_pair_age_hours"]:
         return None
+    if pair_age_hours < c["min_pair_age_hours"]:
+        return None  # too fresh — first 1-2h is rug territory
 
     # ── LIFTOFF SIGNALS ──
     signals = []
@@ -450,8 +454,8 @@ def run_scan(boosted, profiles, metas):
     for pair in unique:
         result = detect_liftoff(pair, boosted, profiles)
         if result:
-            addr = result["token_address"].lower()
-            # Check cooldown
+            addr = result["token_address"]
+            # Check cooldown (case-sensitive — Solana base58)
             if addr in alerted_tokens:
                 if now - alerted_tokens[addr] < cooldown:
                     continue

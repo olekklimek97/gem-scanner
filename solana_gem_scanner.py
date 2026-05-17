@@ -32,7 +32,7 @@ CONFIG = {
     "max_fdv": 10_000_000,            # Max fully diluted valuation
     "min_fdv": 5_000,                 # Min FDV — niższy próg
     "max_pair_age_hours": 168,        # Max wiek pary (7 dni)
-    "min_pair_age_hours": 0.5,        # Min wiek — pół godziny
+    "min_pair_age_hours": 2,          # Min wiek — 2h (większość rugów dzieje się w pierwszych 1-2h)
 
     # Scoring — buy/sell ratio
     "healthy_buy_sell_min": 0.6,      # Min stosunek buys/total (>60% = bullish)
@@ -95,10 +95,11 @@ def get_boosted_tokens():
     if not data:
         return set()
     # Zwróć set adresów boostowanych tokenów Solana
+    # Solana addresses are base58 — keep original case.
     boosted = set()
     for t in data:
         if t.get("chainId") == "solana":
-            boosted.add(t.get("tokenAddress", "").lower())
+            boosted.add(t.get("tokenAddress", ""))
     return boosted
 
 
@@ -111,7 +112,7 @@ def get_latest_profiles():
     profiles = {}
     for p in data:
         if p.get("chainId") == "solana":
-            addr = p.get("tokenAddress", "").lower()
+            addr = p.get("tokenAddress", "")
             profiles[addr] = {
                 "has_website": any(l.get("type") == "website" for l in (p.get("links") or [])),
                 "has_twitter": any(l.get("type") == "twitter" for l in (p.get("links") or [])),
@@ -171,7 +172,7 @@ def score_pair(pair, boosted_addrs, profiles):
         return None
 
     base = pair.get("baseToken", {})
-    token_addr = base.get("address", "").lower()
+    token_addr = base.get("address", "")
     token_name = base.get("name", "?")
     token_symbol = base.get("symbol", "?")
 
