@@ -89,6 +89,7 @@ class SafetyReport:
     lp_locked: Optional[bool] = None
 
     top10_holder_pct: float = 0.0
+    top20_holder_pct: float = 0.0
     holder_count: int = 0
 
     rugcheck_score: int = 0
@@ -108,6 +109,7 @@ class SafetyReport:
             (self.freeze_revoked, f"Freeze authority: {'REVOKED ✓' if self.freeze_revoked else 'ACTIVE ⚠️'}", ""),
             (self.lp_burned_pct >= SAFETY_CONFIG["min_lp_burned_pct"], f"LP burned: {self.lp_burned_pct:.0f}%", ""),
             (self.top10_holder_pct <= SAFETY_CONFIG["max_top10_holder_pct"], f"Top 10 holders: {self.top10_holder_pct:.1f}%", ""),
+            (self.top20_holder_pct <= NEW_SAFETY_CONFIG["max_top20_holder_pct"], f"Top 20 holders: {self.top20_holder_pct:.1f}%", ""),
         ]
 
         for ok, msg, detail in checks:
@@ -220,6 +222,7 @@ def check_rugcheck(token_address: str) -> dict:
         "lp_burned_pct": 0.0,
         "lp_locked": None,
         "top10_holder_pct": 0.0,
+        "top20_holder_pct": 0.0,
         "holder_count": 0,
         "score": 0,
         "risks": [],
@@ -309,27 +312,34 @@ def _parse_rugcheck_report(data: dict, result: dict):
                     if locked_pct and float(locked_pct) > 50:
                         result["lp_locked"] = True
 
-    # Top holders
+    # Top holders — compute top-10 and top-20 in one pass, both excluding
+    # known LP/burn addresses so the percentages reflect real concentration
+    # among wallets that could actually dump.
     top_holders = data.get("topHolders", [])
     if isinstance(top_holders, list):
-        total_pct = 0
-        count = 0
-        for h in top_holders[:10]:
-            if isinstance(h, dict):
-                pct = h.get("pct", h.get("percentage", 0))
-                # Skip known LP/burn addresses (Solana base58 — case-sensitive)
-                addr = h.get("address", "")
-                is_system = "1111111111111" in addr  # Burn address (all digits)
-                # Owner is a protocol label (e.g. "Raydium AMM"), not an address —
-                # case-insensitive substring match is appropriate here.
-                owner = (h.get("owner", "") or "").lower()
-                is_lp = "raydium" in owner or "orca" in owner or "burn" in owner
+        top10_pct = 0.0
+        top20_pct = 0.0
+        for i, h in enumerate(top_holders[:20]):
+            if not isinstance(h, dict):
+                continue
+            pct = h.get("pct", h.get("percentage", 0))
+            # Skip known LP/burn addresses (Solana base58 — case-sensitive)
+            addr = h.get("address", "")
+            is_system = "1111111111111" in addr  # Burn address (all digits)
+            # Owner is a protocol label (e.g. "Raydium AMM"), not an address —
+            # case-insensitive substring match is appropriate here.
+            owner = (h.get("owner", "") or "").lower()
+            is_lp = "raydium" in owner or "orca" in owner or "burn" in owner
 
-                if not is_system and not is_lp:
-                    total_pct += float(pct)
-                    count += 1
+            if is_system or is_lp:
+                continue
+            pct_f = float(pct)
+            top20_pct += pct_f
+            if i < 10:
+                top10_pct += pct_f
 
-        result["top10_holder_pct"] = total_pct
+        result["top10_holder_pct"] = top10_pct
+        result["top20_holder_pct"] = top20_pct
         result["holder_count"] = len(top_holders)
 
     # Also check for specific risk flags in the data
@@ -406,6 +416,7 @@ def run_safety_check(token_address: str) -> SafetyReport:
 
         # Top holders
         report.top10_holder_pct = rc["top10_holder_pct"]
+        report.top20_holder_pct = rc.get("top20_holder_pct", 0.0)
         report.holder_count = rc["holder_count"]
         if rc["top10_holder_pct"] <= 15:
             score += 15
@@ -417,6 +428,16 @@ def run_safety_check(token_address: str) -> SafetyReport:
         else:
             score -= 20
             report.warnings.append(f"EXTREME holder concentration: {rc['top10_holder_pct']:.0f}%")
+
+        # Top-20 concentration — wider net catches "many-medium-wallets" rugs
+        # that pass the top-10 filter.
+        max_top20 = NEW_SAFETY_CONFIG["max_top20_holder_pct"]
+        if report.top20_holder_pct > max_top20:
+            score -= 15
+            report.warnings.append(
+                f"Top-20 holders own {report.top20_holder_pct:.0f}% "
+                f"(> {max_top20}% limit)"
+            )
 
         # RugCheck score
         report.rugcheck_score = rc["score"]
@@ -439,6 +460,8 @@ def run_safety_check(token_address: str) -> SafetyReport:
     if report.freeze_revoked is False and SAFETY_CONFIG["require_freeze_revoked"]:
         hard_fail = True
     if report.top10_holder_pct > SAFETY_CONFIG["max_top10_holder_pct"]:
+        hard_fail = True
+    if report.top20_holder_pct > NEW_SAFETY_CONFIG["max_top20_holder_pct"]:
         hard_fail = True
 
     report.passed = not hard_fail and report.score >= 30
@@ -501,6 +524,19 @@ NEW_SAFETY_CONFIG = {
     "honeypot_impact_diff_max_pct": 30,    # >30% impact diff between sell sizes = suspect
     "deployer_max_recent_tokens": 5,        # >5 tokens in 7 days = serial deployer
     "mint_recheck_interval_sec": 300,       # re-check mint authority every 5 min
+
+    # LP unlock check — reject tokens where the LP is locked but unlocks soon.
+    # A short lock is functionally a delayed rug.
+    "lp_unlock_min_days": 30,
+
+    # Deployer rug-history check
+    "deployer_serial_rugger_threshold": 3,  # 3+ rugs in 30d = serial rugger
+    "deployer_rug_lookback_days": 30,
+    "deployer_rug_liquidity_drop_pct": 90,  # >90% liq drop within 24h of deploy = rug
+
+    # Top-20 holder concentration (separate from top-10)
+    "max_top20_holder_pct": 40,
+    "holder_snapshot_size": 20,             # how many holders to track in baseline
 }
 
 
@@ -581,14 +617,17 @@ def monitor_liquidity(token_address: str, baseline_liquidity_usd: float) -> dict
 # ─── LAYER 2: HOLDER CONCENTRATION TRACKING ────────────────
 
 def _take_holder_snapshot(token_address: str) -> list:
-    """Return list of top-10 {address, pct} from RugCheck."""
+    """Return list of top-N {address, pct} from RugCheck, where N is
+    `holder_snapshot_size` in NEW_SAFETY_CONFIG (default 20). This is the
+    baseline used for continuous monitoring of holder dumps."""
     data = _rugcheck_report(token_address)
     if not data:
         return []
+    n = NEW_SAFETY_CONFIG.get("holder_snapshot_size", 20)
     holders = data.get("topHolders") or []
     return [
         {"address": (h.get("address") or "")[:44], "pct": float(h.get("pct", 0) or 0)}
-        for h in holders[:10]
+        for h in holders[:n]
         if isinstance(h, dict)
     ]
 
@@ -708,14 +747,66 @@ def _is_dead_address(addr: str) -> bool:
     return False
 
 
+def _extract_lp_unlock_epoch(lp: dict) -> Optional[float]:
+    """Pull a unix-epoch (seconds) unlock timestamp out of a RugCheck lp dict.
+
+    RugCheck's schema is not stable — we try several field names and accept
+    either epoch-seconds, epoch-milliseconds, or an ISO-8601 string. Returns
+    None when no usable timestamp is present.
+    """
+    if not isinstance(lp, dict):
+        return None
+    candidates = (
+        lp.get("unlockDate"),
+        lp.get("unlockTime"),
+        lp.get("unlockAt"),
+        lp.get("unlock_at"),
+        lp.get("lockedUntil"),
+        lp.get("lockExpiry"),
+        lp.get("expiry"),
+    )
+    for v in candidates:
+        if v in (None, "", 0):
+            continue
+        # Numeric: heuristic — values > 10^12 are ms, smaller are seconds.
+        if isinstance(v, (int, float)):
+            return v / 1000.0 if v > 1e12 else float(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                continue
+            # ISO-8601
+            try:
+                from datetime import datetime as _dt
+                return _dt.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+            except (ValueError, ImportError):
+                pass
+            # Numeric string
+            try:
+                n = float(s)
+                return n / 1000.0 if n > 1e12 else n
+            except ValueError:
+                continue
+    return None
+
+
 def verify_lp_dead_address(token_address: str, rpc_url: str = DEFAULT_RPC_URL) -> dict:
-    """Verify top LP holder is on a real burn address (not a contract that could unlock)."""
+    """Verify top LP holder is on a real burn address (not a contract that could unlock).
+
+    Also inspects LP lock unlock dates: if the LP is locked but unlocks within
+    `lp_unlock_min_days` (default 30) from now, sets `locked_short_term=True`.
+    A short lock is functionally a delayed rug — the pre-buy gate treats this
+    as a blocking failure.
+    """
     result = {
         "layer": "lp_verification",
         "ok": True,
         "lp_safe": False,
         "lp_holder": None,
         "holder_type": "unknown",
+        "locked_short_term": False,
+        "lp_unlock_epoch": None,
+        "lp_unlock_days": None,
         "message": "",
     }
     cached = _cache_get("lp_verification", token_address)
@@ -734,6 +825,33 @@ def verify_lp_dead_address(token_address: str, rpc_url: str = DEFAULT_RPC_URL) -
         result["message"] = "No LP market data"
         _cache_set("lp_verification", token_address, result)
         return result
+
+    # Inspect LP unlock dates across all markets — take the *soonest* unlock
+    # (worst case for the buyer).
+    min_unlock_epoch: Optional[float] = None
+    for m in markets:
+        if not isinstance(m, dict):
+            continue
+        lp = m.get("lp") or {}
+        unlock = _extract_lp_unlock_epoch(lp)
+        if unlock is not None:
+            if min_unlock_epoch is None or unlock < min_unlock_epoch:
+                min_unlock_epoch = unlock
+
+    if min_unlock_epoch is not None:
+        days_until_unlock = (min_unlock_epoch - time.time()) / 86400.0
+        result["lp_unlock_epoch"] = min_unlock_epoch
+        result["lp_unlock_days"] = round(days_until_unlock, 1)
+        min_days = NEW_SAFETY_CONFIG["lp_unlock_min_days"]
+        if days_until_unlock < min_days:
+            result["locked_short_term"] = True
+            result["message"] = (
+                f"🚨 LP unlocks in {days_until_unlock:.1f} days "
+                f"(<{min_days}d threshold) — short lock = delayed rug risk"
+            )
+            # Short circuit: regardless of holder address, this is a fail.
+            _cache_set("lp_verification", token_address, result)
+            return result
 
     # Find any pair's LP holders
     lp_holders = []
@@ -877,8 +995,85 @@ def honeypot_check_multi_amount(token_address: str, total_tokens_simulated: int 
 
 # ─── LAYER 6: DEPLOYER HISTORY CHECK ───────────────────────
 
+def _looks_rugged(item: dict, drop_threshold_pct: float) -> bool:
+    """Heuristic: does this RugCheck creator-tokens entry look like a rug?
+
+    Accepts an explicit `rugged` flag if present, otherwise infers from a large
+    liquidity collapse vs. initial. RugCheck field names are inconsistent so
+    we accept several spellings.
+    """
+    if not isinstance(item, dict):
+        return False
+    # Explicit rug flag (most reliable when present)
+    for key in ("rugged", "isRugged", "rug"):
+        v = item.get(key)
+        if isinstance(v, bool) and v:
+            return True
+
+    # Otherwise infer from liquidity collapse
+    liq = item.get("liquidity") or {}
+    if isinstance(liq, dict):
+        initial = liq.get("initial") or liq.get("initialUsd") or liq.get("startUsd") or 0
+        current = liq.get("current") or liq.get("currentUsd") or liq.get("usd") or 0
+        try:
+            initial_f = float(initial)
+            current_f = float(current)
+        except (TypeError, ValueError):
+            return False
+        if initial_f > 0:
+            drop_pct = (initial_f - current_f) / initial_f * 100.0
+            if drop_pct >= drop_threshold_pct:
+                return True
+    return False
+
+
+def _deployment_within_window(item: dict, lookback_days: int) -> bool:
+    """True if the deployment timestamp is within the lookback window.
+
+    If no usable timestamp is present we include the item (better to over-count
+    than miss a recent rug — false positives only cost us a buy, not money).
+    """
+    if not isinstance(item, dict):
+        return False
+    ts_raw = (
+        item.get("createdAt")
+        or item.get("created_at")
+        or item.get("deployedAt")
+        or item.get("createdTime")
+    )
+    if ts_raw in (None, "", 0):
+        return True  # unknown — include defensively
+    try:
+        ts = float(ts_raw)
+        # heuristic: ms vs sec
+        if ts > 1e12:
+            ts = ts / 1000.0
+    except (TypeError, ValueError):
+        # ISO string fallback
+        try:
+            from datetime import datetime as _dt
+            ts = _dt.fromisoformat(str(ts_raw).replace("Z", "+00:00")).timestamp()
+        except (ValueError, ImportError):
+            return True
+    age_days = (time.time() - ts) / 86400.0
+    return 0 <= age_days <= lookback_days
+
+
 def check_deployer(token_address: str) -> dict:
-    """Look up token deployer and count their recent deployments. Flag serial deployers."""
+    """Look up token deployer, count recent deployments, and detect serial ruggers.
+
+    Two signals come out of this:
+      - `recent_deployments`: raw count of tokens by this deployer (existing).
+      - `rug_count_30d` / `is_serial_rugger`: how many of those rugged within
+        the lookback window (default 30 days), where a "rug" is either an
+        explicit RugCheck flag or a >90% liquidity drop.
+
+    Also tags `is_whitelisted_launchpad=True` when the deployer is on the
+    launchpad whitelist (e.g. Pump.fun) — caller may use this as a positive
+    score signal.
+
+    Cached for 1 hour on success (RugCheck calls are slow and rate-limited).
+    """
     cached = _cache_get("deployer", token_address)
     if cached is not None:
         return cached
@@ -889,6 +1084,10 @@ def check_deployer(token_address: str) -> dict:
         "warning": False,
         "deployer": None,
         "recent_deployments": 0,
+        "rug_count_30d": 0,
+        "is_serial_rugger": False,
+        "is_whitelisted_launchpad": False,
+        "launchpad_label": "",
         "message": "",
     }
     data = _rugcheck_report(token_address)
@@ -907,22 +1106,52 @@ def check_deployer(token_address: str) -> dict:
     )
     result["deployer"] = deployer
 
+    # Launchpad whitelist lookup
+    try:
+        from launchpad_whitelist import is_whitelisted_launchpad, launchpad_label
+        if is_whitelisted_launchpad(deployer or ""):
+            result["is_whitelisted_launchpad"] = True
+            result["launchpad_label"] = launchpad_label(deployer or "")
+    except ImportError:
+        pass  # whitelist module optional
+
     # Recent deployments list (if RugCheck returns it)
     history = data.get("creatorTokens") or data.get("deployerTokens") or []
-    if isinstance(history, list):
-        count = len(history)
-    else:
-        count = 0
-    result["recent_deployments"] = count
+    if not isinstance(history, list):
+        history = []
+    result["recent_deployments"] = len(history)
+
+    # Count rugs within the lookback window
+    lookback = NEW_SAFETY_CONFIG["deployer_rug_lookback_days"]
+    drop_threshold = NEW_SAFETY_CONFIG["deployer_rug_liquidity_drop_pct"]
+    rug_threshold = NEW_SAFETY_CONFIG["deployer_serial_rugger_threshold"]
+
+    rug_count = 0
+    for item in history:
+        if _deployment_within_window(item, lookback) and _looks_rugged(item, drop_threshold):
+            rug_count += 1
+    result["rug_count_30d"] = rug_count
+    result["is_serial_rugger"] = rug_count >= rug_threshold
 
     threshold = NEW_SAFETY_CONFIG["deployer_max_recent_tokens"]
     if not deployer:
         result["message"] = "Deployer unknown"
-    elif count > threshold:
+    elif result["is_serial_rugger"]:
         result["warning"] = True
-        result["message"] = f"⚠️ Serial deployer: {count} tokens by {deployer[:20]}..."
+        result["message"] = (
+            f"🚨 SERIAL RUGGER: {rug_count} rugs in last {lookback}d "
+            f"by {deployer[:20]}..."
+        )
+    elif result["recent_deployments"] > threshold:
+        result["warning"] = True
+        suffix = f" [whitelisted: {result['launchpad_label']}]" if result["is_whitelisted_launchpad"] else ""
+        result["message"] = (
+            f"⚠️ Serial deployer: {result['recent_deployments']} tokens "
+            f"by {deployer[:20]}...{suffix}"
+        )
     else:
-        result["message"] = f"OK: deployer has {count} known tokens"
+        suffix = f" [whitelisted: {result['launchpad_label']}]" if result["is_whitelisted_launchpad"] else ""
+        result["message"] = f"OK: deployer has {result['recent_deployments']} known tokens{suffix}"
 
     _cache_set("deployer", token_address, result)
     return result
@@ -943,6 +1172,7 @@ def run_full_safety_check(token_address: str) -> dict:
         "freeze_revoked": legacy.freeze_revoked,
         "lp_burned_pct": legacy.lp_burned_pct,
         "top10_holder_pct": legacy.top10_holder_pct,
+        "top20_holder_pct": legacy.top20_holder_pct,
         "rugcheck_score": legacy.rugcheck_score,
         "rugcheck_risks": legacy.rugcheck_risks,
         "warnings": legacy.warnings,
@@ -983,8 +1213,16 @@ def run_full_safety_check(token_address: str) -> dict:
         report["passed"] = False
         report["blocking_reasons"].append("legacy_safety_failed")
 
-    # LP: not strictly blocking but penalize unsafe LP
-    if lp.get("ok") and not lp.get("lp_safe"):
+    # LP unlock window: short locks (<30d) are effectively a delayed rug — REJECT.
+    if lp.get("locked_short_term"):
+        report["passed"] = False
+        days = lp.get("lp_unlock_days")
+        report["blocking_reasons"].append(
+            f"lp_unlock_short_term({days}d)" if days is not None else "lp_unlock_short_term"
+        )
+
+    # LP holder type: not strictly blocking but penalize unsafe LP
+    if lp.get("ok") and not lp.get("lp_safe") and not lp.get("locked_short_term"):
         report["score"] = max(0, report["score"] - 10)
         # Don't block (many legit tokens use locks, not burns), just penalize
 
@@ -996,9 +1234,20 @@ def run_full_safety_check(token_address: str) -> dict:
             report["passed"] = False
             report["blocking_reasons"].append("multi_amount_honeypot")
 
-    # Deployer: warning only
-    if dp.get("warning"):
+    # Deployer: serial-rugger is a hard block; non-rug serial deployer is a penalty.
+    if dp.get("is_serial_rugger"):
+        report["passed"] = False
+        report["blocking_reasons"].append(
+            f"serial_rugger({dp.get('rug_count_30d', 0)}_rugs_30d)"
+        )
+    elif dp.get("warning"):
         report["score"] = max(0, report["score"] - 5)
+
+    # Whitelisted launchpad: +10 score boost (clamped to 100).
+    # Soft signal only — does NOT reverse any blocking failure above.
+    if dp.get("is_whitelisted_launchpad"):
+        report["score"] = min(100, report["score"] + 10)
+        report["launchpad_boost"] = dp.get("launchpad_label", "")
 
     return report
 
@@ -1011,6 +1260,8 @@ def summarize_full_report(report: dict) -> str:
     lines.append(f"     {report['layers']['honeypot_multi_amount'].get('message', '')}")
     lines.append(f"     {report['layers']['deployer_history'].get('message', '')}")
     lines.append(f"     {report['layers']['holders_baseline'].get('message', '')}")
+    if report.get("launchpad_boost"):
+        lines.append(f"     🚀 Launchpad boost: +10 ({report['launchpad_boost']})")
     verdict = "✅ PASSED" if report["passed"] else "❌ FAILED"
     lines.append(f"  {verdict} (score {report['score']}/100)")
     if report["blocking_reasons"]:

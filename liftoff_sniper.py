@@ -38,6 +38,7 @@ CONFIG = {
     "min_fdv": 5_000,                 # Min FDV
     "min_liquidity": 2_000,           # Min płynność
     "max_pair_age_hours": 48,         # Max wiek pary
+    "min_pair_age_hours": 2,          # Min wiek — 2h (większość rugów w pierwszych 1-2h)
 
     # Price momentum
     "min_price_change_5m": 5,         # Min +5% w 5 min
@@ -253,6 +254,8 @@ def detect_liftoff(pair, boosted, profiles):
         return None
     if pair_age_hours > c["max_pair_age_hours"]:
         return None
+    if pair_age_hours < c["min_pair_age_hours"]:
+        return None  # too fresh — first 1-2h is rug territory
 
     # ── LIFTOFF SIGNALS ──
     signals = []

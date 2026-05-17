@@ -32,7 +32,7 @@ CONFIG = {
     "max_fdv": 10_000_000,            # Max fully diluted valuation
     "min_fdv": 5_000,                 # Min FDV — niższy próg
     "max_pair_age_hours": 168,        # Max wiek pary (7 dni)
-    "min_pair_age_hours": 0.5,        # Min wiek — pół godziny
+    "min_pair_age_hours": 2,          # Min wiek — 2h (większość rugów dzieje się w pierwszych 1-2h)
 
     # Scoring — buy/sell ratio
     "healthy_buy_sell_min": 0.6,      # Min stosunek buys/total (>60% = bullish)
