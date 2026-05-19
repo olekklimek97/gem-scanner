@@ -184,10 +184,21 @@ def search_pairs(query):
 
 # ─── LIFTOFF DETECTOR ───────────────────────────────────────
 
-def detect_liftoff(pair, boosted, profiles):
+def _bump(stats, key, n=1):
+    """Increment a counter in the diagnostic stats dict (no-op if stats is None)."""
+    if stats is not None:
+        stats[key] = stats.get(key, 0) + n
+
+
+def detect_liftoff(pair, boosted, profiles, stats=None):
     """
     Detect if a token is in early liftoff phase.
     Returns detection dict or None.
+
+    If `stats` (a dict) is provided, every rejection point increments a
+    counter on it. Pairs that pass hard filters also push an entry into
+    stats["candidates"] (regardless of final score) so the caller can
+    inspect near-misses.
     """
     global previous_scan
     now = datetime.now(timezone.utc)
@@ -196,6 +207,7 @@ def detect_liftoff(pair, boosted, profiles):
     # Basic data
     chain = pair.get("chainId", "")
     if chain != "solana":
+        _bump(stats, "rejected_not_solana")
         return None
 
     base = pair.get("baseToken", {})
@@ -248,14 +260,25 @@ def detect_liftoff(pair, boosted, profiles):
         pair_age_hours = 999
 
     # ── HARD FILTERS ──
+    # Order is intentional: cheapest filters first, and we count rejections so
+    # the scan summary can show where pairs are dying.
     if liq < c["min_liquidity"]:
+        _bump(stats, "rejected_min_liquidity")
         return None
-    if fdv and (fdv > c["max_fdv"] or fdv < c["min_fdv"]):
+    if fdv and fdv < c["min_fdv"]:
+        _bump(stats, "rejected_min_fdv")
         return None
-    if pair_age_hours > c["max_pair_age_hours"]:
+    if fdv and fdv > c["max_fdv"]:
+        _bump(stats, "rejected_max_fdv")
         return None
     if pair_age_hours < c["min_pair_age_hours"]:
+        _bump(stats, "rejected_too_young")
         return None  # too fresh — first 1-2h is rug territory
+    if pair_age_hours > c["max_pair_age_hours"]:
+        _bump(stats, "rejected_too_old")
+        return None
+
+    _bump(stats, "passed_hard_filters")
 
     # ── LIFTOFF SIGNALS ──
     signals = []
@@ -353,8 +376,46 @@ def detect_liftoff(pair, boosted, profiles):
 
     score = max(0, min(100, score))
 
+    # ── DIAGNOSTIC: also count signal MISSES for pairs that passed hard filters.
+    # These aren't hard filters in the sniper today (they're scoring inputs), but
+    # the user wants visibility into them. Count miss-rates so we can see which
+    # signals are bottlenecking the score.
+    if stats is not None:
+        if vol_5m < c["min_volume_5m"]:
+            _bump(stats, "signal_miss_volume_5m")
+        if vol_1h < c["min_volume_1h"]:
+            _bump(stats, "signal_miss_volume_1h")
+        if total_1h < c["min_txns_1h"]:
+            _bump(stats, "signal_miss_txns_1h")
+        if pc_5m < c["min_price_change_5m"]:
+            _bump(stats, "signal_miss_price_change_5m")
+        if pc_1h < c["min_price_change_1h"]:
+            _bump(stats, "signal_miss_price_change_1h")
+        if total_5m <= 10:
+            _bump(stats, "signal_miss_buy_pressure_5m_too_few_txns")
+        elif buys_5m / total_5m < c["min_buy_ratio"]:
+            _bump(stats, "signal_miss_buy_ratio_5m")
+
+        # Always record candidates (passed hard filters) regardless of score —
+        # caller will sort by score and surface near-misses.
+        stats.setdefault("candidates", []).append({
+            "token_name": token_name,
+            "token_symbol": token_symbol,
+            "token_address": base.get("address", ""),
+            "score": score,
+            "signals": list(signals),
+            "warnings": list(warnings),
+            "liquidity": liq,
+            "fdv": fdv,
+            "vol_5m": vol_5m,
+            "vol_1h": vol_1h,
+            "pair_age_hours": round(pair_age_hours, 1),
+            "url": pair.get("url", ""),
+        })
+
     # ── MIN SCORE TO ALERT ──
     if score < 40:
+        _bump(stats, "rejected_low_score")
         return None
 
     # Signal strength
@@ -451,19 +512,93 @@ def run_scan(boosted, profiles, metas):
     now = datetime.now()
     cooldown = timedelta(minutes=CONFIG["alert_cooldown_minutes"])
 
+    # Diagnostic counters — detect_liftoff bumps these as it walks each filter.
+    stats = {"scanned": len(unique)}
+
     for pair in unique:
-        result = detect_liftoff(pair, boosted, profiles)
+        result = detect_liftoff(pair, boosted, profiles, stats=stats)
         if result:
             addr = result["token_address"]
             # Check cooldown (case-sensitive — Solana base58)
             if addr in alerted_tokens:
                 if now - alerted_tokens[addr] < cooldown:
+                    _bump(stats, "rejected_cooldown")
                     continue
             detections.append(result)
             alerted_tokens[addr] = now
 
     detections.sort(key=lambda x: x["score"], reverse=True)
+    _print_filter_breakdown(stats)
     return detections[:CONFIG["top_n"]], len(unique)
+
+
+# ─── DIAGNOSTIC FILTER-BREAKDOWN PRINTER ────────────────────
+
+def _print_filter_breakdown(stats: dict):
+    """Print a per-cycle breakdown of where pairs are getting rejected and
+    show the top-3 near-miss candidates (passed hard filters but did not
+    reach LIFTOFF score 75)."""
+    c = CONFIG
+    total = stats.get("scanned", 0)
+    passed = stats.get("passed_hard_filters", 0)
+
+    # Hard-filter rejections — labels match the config keys that gate them
+    hard = [
+        ("Too young (<{}h)".format(c["min_pair_age_hours"]),         stats.get("rejected_too_young", 0)),
+        ("Too old (>{}h)".format(c["max_pair_age_hours"]),           stats.get("rejected_too_old", 0)),
+        ("Low liquidity (<${:,})".format(c["min_liquidity"]),        stats.get("rejected_min_liquidity", 0)),
+        ("FDV too low (<${:,})".format(c["min_fdv"]),                stats.get("rejected_min_fdv", 0)),
+        ("FDV too high (>${:,})".format(c["max_fdv"]),               stats.get("rejected_max_fdv", 0)),
+        ("Not Solana chain",                                          stats.get("rejected_not_solana", 0)),
+    ]
+    low_score = stats.get("rejected_low_score", 0)
+    cooldown_drops = stats.get("rejected_cooldown", 0)
+
+    print(f"\n  📊 Filter breakdown ({total} pairs scanned):")
+    print(f"     ✓ Passed all hard filters: {passed}")
+    for label, count in hard:
+        if count > 0:
+            print(f"     ❌ {label}: {count}")
+    if low_score > 0:
+        print(f"     ⚪ Passed hard filters but score < 40 (alert gate): {low_score}")
+    if cooldown_drops > 0:
+        print(f"     🕒 Alerted but dropped by {c['alert_cooldown_minutes']}m cooldown: {cooldown_drops}")
+
+    # Signal-miss counts among pairs that passed hard filters. These are NOT
+    # hard filters in the sniper today — they feed into the score. Showing the
+    # miss rate helps decide whether to promote any of them to hard filters.
+    sig_misses = [
+        ("vol_5m  < ${:,}".format(c["min_volume_5m"]),         stats.get("signal_miss_volume_5m", 0)),
+        ("vol_1h  < ${:,}".format(c["min_volume_1h"]),         stats.get("signal_miss_volume_1h", 0)),
+        ("txns_1h < {}".format(c["min_txns_1h"]),              stats.get("signal_miss_txns_1h", 0)),
+        ("pc_5m   < {}%".format(c["min_price_change_5m"]),     stats.get("signal_miss_price_change_5m", 0)),
+        ("pc_1h   < {}%".format(c["min_price_change_1h"]),     stats.get("signal_miss_price_change_1h", 0)),
+        ("buy ratio 5m < {}".format(c["min_buy_ratio"]),       stats.get("signal_miss_buy_ratio_5m", 0)),
+        ("5m txns ≤ 10 (buy-ratio skipped)",                   stats.get("signal_miss_buy_pressure_5m_too_few_txns", 0)),
+    ]
+    sig_misses = [(l, n) for (l, n) in sig_misses if n > 0]
+    if passed and sig_misses:
+        print(f"     ── Signal-miss counts (among the {passed} that passed hard filters; informational, not a filter) ──")
+        for label, count in sig_misses:
+            print(f"        · {label}: {count}/{passed}")
+
+    # Top-3 near-misses: passed hard filters but did not reach LIFTOFF (75).
+    # Sort by score desc.
+    candidates = stats.get("candidates", [])
+    near_misses = [cand for cand in candidates if cand["score"] < 75]
+    near_misses.sort(key=lambda x: x["score"], reverse=True)
+    if near_misses:
+        print(f"     ── Top {min(3, len(near_misses))} near-miss candidates (passed hard filters, score < 75) ──")
+        for i, cand in enumerate(near_misses[:3], 1):
+            sigs = " | ".join(cand["signals"]) if cand["signals"] else "(no signals hit)"
+            print(f"        #{i} score={cand['score']:>3}  "
+                  f"{cand['token_name']} (${cand['token_symbol']})  "
+                  f"age={cand['pair_age_hours']:.1f}h  "
+                  f"liq=${cand['liquidity']:,.0f}  "
+                  f"v5m=${cand['vol_5m']:,.0f}  v1h=${cand['vol_1h']:,.0f}")
+            print(f"            signals: {sigs}")
+            if cand["warnings"]:
+                print(f"            warnings: {' | '.join(cand['warnings'])}")
 
 
 def print_header():
