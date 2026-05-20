@@ -41,7 +41,7 @@ CONFIG = {
     "min_fdv": 5_000,                 # Min FDV
     "min_liquidity": 2_000,           # Min płynność (anti-rug — keep strict)
     "max_pair_age_hours": 168,        # Max wiek pary — loosened from 48 (up to 7 dni)
-    "min_pair_age_hours": 2,          # Min wiek — 2h (anti-rug, keep strict)
+    "min_pair_age_hours": 0.5,        # Min wiek — 30 min (loosened from 2h; safety_module's 6-layer pre-buy gate covers rug protection at trade time)
 
     # Price momentum
     "min_price_change_5m": 5,         # Min +5% w 5 min
