@@ -30,15 +30,18 @@ CONFIG = {
     "scan_interval_seconds": 180,     # Co 3 minuty
 
     # LIFTOFF detection thresholds
-    "min_volume_5m": 5_000,           # Min volume w 5 min ($5K = coś się dzieje)
-    "min_volume_1h": 20_000,          # Min volume w 1h
+    # Loosened 2026-05: diagnostic logging showed most pairs were dying at
+    # max_fdv / max_pair_age, and few were hitting the volume signal bonuses.
+    # Anti-rug filters (min_pair_age_hours, min_liquidity, min_fdv) unchanged.
+    "min_volume_5m": 2_000,           # Min volume w 5 min — loosened from 5_000
+    "min_volume_1h": 10_000,          # Min volume w 1h — loosened from 20_000
     "min_buy_ratio": 0.65,            # Min buy/total ratio (65%+ = agresywne kupowanie)
     "min_txns_1h": 50,                # Min transakcji w 1h
-    "max_fdv": 5_000_000,             # Max FDV — powyżej = za późno
+    "max_fdv": 30_000_000,            # Max FDV — loosened from 5_000_000 (allow up to $30M)
     "min_fdv": 5_000,                 # Min FDV
-    "min_liquidity": 2_000,           # Min płynność
-    "max_pair_age_hours": 48,         # Max wiek pary
-    "min_pair_age_hours": 2,          # Min wiek — 2h (większość rugów w pierwszych 1-2h)
+    "min_liquidity": 2_000,           # Min płynność (anti-rug — keep strict)
+    "max_pair_age_hours": 168,        # Max wiek pary — loosened from 48 (up to 7 dni)
+    "min_pair_age_hours": 2,          # Min wiek — 2h (anti-rug, keep strict)
 
     # Price momentum
     "min_price_change_5m": 5,         # Min +5% w 5 min
