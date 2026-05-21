@@ -1,0 +1,117 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── Design tokens ──────────────────────────────────────────────────────
+   Mirrored in tailwind.config.ts. CSS vars exposed here so Recharts (which
+   reads inline styles) and any third-party libs can pick them up.
+*/
+:root {
+  --bg: #0a0e0a;
+  --bg-alt: #0f1410;
+  --ink: #e8f0d8;
+  --ink-dim: #8a9686;
+  --green: #6dd366;
+  --amber: #f4b942;
+  --red: #ff5b5b;
+  --blue: #5cc8ff;
+  --magenta: #ff6bd6;
+  --line: #1c2418;
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-space-grotesk), system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 48x48 dotted grid behind everything. Layered above bg color, below content. */
+body {
+  background-image: radial-gradient(circle, rgba(109, 211, 102, 0.06) 1px, transparent 1px);
+  background-size: 48px 48px;
+  background-position: 0 0;
+  background-attachment: fixed;
+}
+
+/* Selection in the brand green for the visual signal */
+::selection {
+  background: var(--green);
+  color: var(--bg);
+}
+
+/* ─── Component utilities ───────────────────────────────────────────────── */
+
+/* Sharp 1px line card that flips border to brand green on hover and lifts 2px */
+.line-card {
+  background: var(--bg-alt);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  transition: border-color 200ms ease, transform 200ms ease, box-shadow 200ms ease;
+}
+.line-card:hover {
+  border-color: var(--green);
+  transform: translateY(-2px);
+}
+
+/* Uppercase mono labels used everywhere for axis labels / column headers / etc */
+.label-mono {
+  font-family: var(--font-jetbrains-mono), ui-monospace, monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+
+/* Big display numbers in Fraunces serif */
+.display-number {
+  font-family: var(--font-fraunces), Georgia, serif;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1;
+}
+
+/* Pulsing green dot used on Live badges */
+.live-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 12px rgba(109, 211, 102, 0.7);
+  animation: pulse-dot 1.8s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.85);
+  }
+}
+
+/* Scrollbar styling — subtle dark on dark for the trades list */
+.themed-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
+}
+.themed-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.themed-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.themed-scroll::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 3px;
+}
+.themed-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--ink-dim);
+}
