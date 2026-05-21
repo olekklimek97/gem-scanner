@@ -516,11 +516,62 @@ class PositionManager:
             except:
                 self.positions = []
 
+    # Position lifecycle: once in a terminal state the bot stops monitoring it.
+    # Disk becomes authoritative for these so external edits (e.g. data corrections
+    # for corrupt sells) aren't clobbered by the bot's stale in-memory copy on the
+    # next save triggered by some OTHER position's activity.
+    _TERMINAL_STATES = frozenset({"closed", "dust", "rugged", "stopped", "suspect"})
+
     def save(self):
-        """Atomic save — write to .tmp then rename to prevent corruption."""
-        data = [p.to_dict() for p in self.positions]
+        """Atomic save with read-modify-write merge:
+        - For mutable positions (open/partial): in-memory state wins (the bot owns the truth).
+        - For positions transitioning TO terminal in this save (mem terminal, disk still mutable
+          or absent): in-memory state wins (we need to persist the transition).
+        - For positions that were ALREADY terminal on disk (mem terminal AND disk terminal):
+          disk wins. This preserves manual corrections and prevents the bot from rewriting a
+          position it's no longer managing.
+
+        Without this read-modify-write, two bugs occur:
+        1. Manual fixes to positions.json get clobbered (the trigger for this fix).
+        2. If two bot instances run concurrently, both write their full in-memory state and
+           the loser silently loses everything. Read-modify-write narrows the race window
+           and ensures terminal positions converge."""
+        on_disk_by_addr = {}
+        if self.filepath.exists():
+            try:
+                disk_data = json.loads(self.filepath.read_text(encoding="utf-8"))
+                if isinstance(disk_data, list):
+                    on_disk_by_addr = {
+                        p.get("token_address"): p
+                        for p in disk_data
+                        if isinstance(p, dict) and p.get("token_address")
+                    }
+            except Exception:
+                # Corrupt disk file — fall through and overwrite with in-memory state
+                on_disk_by_addr = {}
+
+        merged = []
+        seen_addrs = set()
+        for pos in self.positions:
+            seen_addrs.add(pos.token_address)
+            in_mem = pos.to_dict()
+            disk_record = on_disk_by_addr.get(pos.token_address)
+            if (pos.status in self._TERMINAL_STATES
+                    and disk_record is not None
+                    and disk_record.get("status") in self._TERMINAL_STATES):
+                # Both terminal — disk is authoritative
+                merged.append(disk_record)
+            else:
+                merged.append(in_mem)
+
+        # Defensive: keep any disk-only records that vanished from memory (shouldn't happen,
+        # but if it did we'd lose history without this)
+        for addr, disk_record in on_disk_by_addr.items():
+            if addr not in seen_addrs:
+                merged.append(disk_record)
+
         tmp_path = self.filepath.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp_path.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(str(tmp_path), str(self.filepath))  # Atomic on most OS
 
     def add(self, position: Position):

@@ -65,3 +65,6 @@ run_dryrun.bat
 CLAUDE.md
 # Claude Code's per-project settings (tool permissions, etc.)
 .claude/
+
+# Block all text files by default (often contain notes, tokens, passwords)
+*.txt
