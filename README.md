@@ -1,138 +1,260 @@
-# Solana Degen Pipeline
+# Gem Scanner — Solana Token Discovery & Trading Automation
 
-A personal automation suite for high-risk Solana memecoin trading. Three standalone
-Python processes that communicate via files on disk: a daily gem scanner that ranks
-new tokens from DexScreener, a real-time liftoff sniper that detects explosive
-momentum every 3 minutes, and an auto-trading bot that consumes sniper alerts and
-manages positions with a cascading take-profit / stop-loss strategy. A local web
-dashboard surfaces open positions, trade history, and past scans. **This is a
-personal project — not packaged or supported for redistribution.**
+> Autonomous AI-built pipeline that scans Solana for emerging tokens, scores
+> them with a 6-layer safety system, and simulates trades with a cascading
+> TP/SL strategy.
 
-## Requirements
+A portfolio project exploring what it actually takes to ship an autonomous
+trading system end-to-end: ingestion → signal scoring → safety gating →
+execution → monitoring → web UI → deployment. Built iteratively with
+Claude Code as the primary development tool, currently running on AWS in
+**dry-run mode** (no real money is moved).
 
-- Python 3.9 or newer (verified on 3.14)
-- `pip` for dependency installation
-- Outbound HTTPS access to: `api.dexscreener.com`, `quote-api.jup.ag`,
-  `api.rugcheck.xyz`, `api.mainnet-beta.solana.com` (or your custom RPC),
-  `frankfurt.mainnet.block-engine.jito.wtf`
+---
 
-## Setup
+## Architecture overview
+
+Three independent Python services plus a Next.js dashboard, deployed on a
+single AWS EC2 instance. Services don't talk over sockets or queues —
+they communicate by writing JSON / NDJSON / SQLite to disk, atomically.
+The Flask backend exposes that on-disk state as a JSON API which the
+Next.js frontend consumes.
+
+```
+   DexScreener  ·  RugCheck  ·  Solana RPC  ·  Jupiter  ·  Jito
+                              │
+                              ▼
+   ┌───────────────────────────────────────────────────┐
+   │  liftoff_sniper.py       (3-min scan loop)        │
+   │     scores momentum → writes sniper_alerts/*.json │
+   └───────────────────────────────────────────────────┘
+                              │
+                              ▼
+   ┌───────────────────────────────────────────────────┐
+   │  trading_bot.py          (15-30s cycle)           │
+   │     polls sniper_alerts/                          │
+   │       → safety_module.py  (6-layer pre-buy gate)  │
+   │       → Jupiter quote + swap                      │
+   │       → Jito block-engine submit (MEV protection) │
+   │     manages cascading TP/SL on open positions     │
+   └───────────────────────────────────────────────────┘
+                              │
+                              ▼
+       positions.json  ·  trade_log.ndjson  ·  scanner_history.db
+                              │
+                              ▼
+   ┌───────────────────────────────────────────────────┐
+   │  dashboard_local.py      (Flask, port 8420)       │
+   │     /api/positions  /api/trades  /api/system-status│
+   │     /api/metrics-summary  /api/history            │
+   └───────────────────────────────────────────────────┘
+                              │
+                              ▼
+   ┌───────────────────────────────────────────────────┐
+   │  dashboard-web/          (Next.js 14, port 3000)  │
+   │     SWR + Recharts, 30s auto-refresh              │
+   └───────────────────────────────────────────────────┘
+```
+
+---
+
+## Tech stack
+
+**Backend**
+- Python 3.10+ (deployed on 3.12), stdlib `http.server` for the API surface,
+  `sqlite3` for scan history, `requests` for outbound HTTP.
+- Domain libraries: `solana`, `solders`, `base58` for transaction signing.
+
+**Frontend**
+- Next.js 14 (App Router) · TypeScript (strict) · React 18
+- Tailwind CSS · SWR (30-second auto-refresh) · Recharts
+- Custom design system with three Google Fonts (Space Grotesk / Fraunces /
+  JetBrains Mono) loaded via `next/font` (no external link tags).
+
+**Infrastructure**
+- AWS EC2 t3.micro (Ubuntu 24.04)
+- systemd unit files with auto-restart for each of the three services
+- `cron` job for nightly state backups (14-day retention)
+- SSH tunneling for dashboard access (no public ports exposed)
+
+**External APIs**
+- [DexScreener](https://docs.dexscreener.com/) — market data, free tier
+- [Jupiter](https://station.jup.ag/docs/apis/swap-api) — DEX quotes + swaps
+- [RugCheck](https://api.rugcheck.xyz) — token safety scores + holders
+- Solana RPC (mainnet-beta or paid endpoint)
+- [Jito Block Engine](https://jito-labs.gitbook.io/mev/) — MEV-protected tx submission
+
+**Dev tools**
+- Claude Code (primary development tool; this entire project is the result of
+  iterative pairing with Claude Sonnet 4.5)
+- Git + GitHub for source control and PR-based review
+- KeePass for credential storage; Docker for an N8N alerting sidecar
+
+---
+
+## Key features
+
+- **Real-time momentum detection** — sniper scans every 3 minutes across
+  DexScreener trending categories and themed search queries (`pump`, `bonk`,
+  `ai agent`, …), scoring each pair against 9 signals (5m/1h volume spike,
+  buy pressure, price momentum, volume acceleration, freshness, social
+  profile).
+- **6-layer safety gate** wrapped around every potential buy:
+  1. Honeypot simulation (multi-amount Jupiter quote round-trip)
+  2. Mint and freeze authority revocation check (live RPC re-check on each
+     bot cycle, with emergency-sell trigger on restore)
+  3. LP burn / lock verification with **short-lock rejection** (LP that
+     unlocks in &lt;30 days is treated as a delayed rug)
+  4. Top-10 + top-20 holder concentration limits
+  5. Deployer reputation — detects serial ruggers from RugCheck history (3+
+     rugged tokens in 30 days → block)
+  6. Continuous liquidity monitoring per open position (>50% drop = emergency
+     sell)
+- **Cascading take-profit** — TP1 at +30% sells just enough to recover the
+  original SOL investment (turning the rest into a risk-free moonbag), then
+  sells 12% of remaining tokens at each +30% step (widening to +50% steps
+  after cascade level 2). Stop-loss is only armed pre-TP1.
+- **Dynamic bot cycle** — interval adjusts to load: 30 s when idle, 15 s
+  with 1-5 open positions, 30 s with 6+ to avoid Jupiter/DexScreener rate
+  limits.
+- **Atomic file-based IPC** — every state write goes to `*.tmp` followed by
+  `os.replace()` so a mid-write crash never leaves a half-written
+  `positions.json`. Read-modify-write merges prevent races when the
+  trading bot and a manual `--sell` command touch the file concurrently.
+- **Adversarial code-review workflow** — when Claude proposes a change, the
+  follow-up turn asks a fresh Claude instance to red-team it. Several
+  shipped fixes (case-sensitive Solana address comparison, duplicate-buy
+  prevention, dust-position auto-close) came from that loop.
+- **Web dashboard with auto-refresh** — Next.js frontend fetches via SWR
+  every 30 s; the trades panel auto-scrolls when a genuinely new event lands
+  (compared against the last-known head timestamp, not just any refresh).
+- **Daily backups via cron** — `backup_data.sh` snapshots `positions.json`,
+  `trade_log.ndjson`, `processed_alerts.json`, and `scanner_history.db`
+  into `backups/YYYY-MM-DD/` with 14-day retention.
+
+---
+
+## Deployment (AWS)
+
+```
+┌─ t3.micro · Ubuntu 24.04 ──────────────────────────────┐
+│                                                        │
+│  /home/ubuntu/gem-scanner/   (git pull from GitHub)    │
+│                                                        │
+│   systemd units                                        │
+│     gem-sniper.service     (liftoff_sniper.py)         │
+│     gem-bot.service        (trading_bot.py --dry-run)  │
+│     gem-dashboard.service  (dashboard_local.py)        │
+│       Restart=always, RestartSec=10                    │
+│                                                        │
+│   cron                                                 │
+│     0 3 * * *  /home/ubuntu/gem-scanner/backup_data.sh │
+│                                                        │
+│   Dashboard reached via SSH tunnel from local machine: │
+│     ssh -L 8420:localhost:8420 ubuntu@<ip>             │
+└────────────────────────────────────────────────────────┘
+```
+
+No public ports. Code updates land via `git pull` after merging a PR on the
+public GitHub repo. systemd restarts handle process crashes; the
+file-based state model means restarts are always safe.
+
+---
+
+## Local development
 
 ```bash
-# 1. Clone
-git clone <your-repo-url> degen-pipeline
-cd degen-pipeline
+# Clone
+git clone https://github.com/olekklimek97/gem-scanner.git
+cd gem-scanner
 
-# 2. Create a virtualenv
+# ─── Backend ────────────────────────────────────────────
 python -m venv .venv
-source .venv/bin/activate         # Linux/macOS
-# .venv\Scripts\activate           # Windows
-
-# 3. Install dependencies
+.venv\Scripts\activate         # Windows
+source .venv/bin/activate      # Linux / macOS
 pip install -r requirements.txt
+cp .env.example .env            # then edit: SOL_PRIVATE_KEY, SOLANA_RPC_URL
 
-# 4. Configure environment
-cp .env.example .env
-# Edit .env: paste your wallet private key (or leave SOL_PRIVATE_KEY empty
-# and create bot_wallet.key with the base58 key on a single line)
-# Set SOLANA_RPC_URL to a paid endpoint if you have one
+# In three separate terminals:
+python liftoff_sniper.py
+python trading_bot.py --dry-run
+python dashboard_local.py       # Flask backend on :8420
 
-# 5. Optional: generate a fresh throwaway wallet for dry-run testing
-python -c "from solders.keypair import Keypair; import base58; kp=Keypair(); \
-  print('Public:', kp.pubkey()); print('Private:', base58.b58encode(bytes(kp)).decode())"
+# ─── Frontend (new terminal) ───────────────────────────
+cd dashboard-web
+npm install
+npm run dev                     # Next.js on :3000
 ```
 
-## Running each component
+Then open **http://localhost:3000**. The legacy HTML dashboard remains
+available at `http://localhost:8420/` if you want to compare.
 
-Each script runs in its own terminal. They communicate through `sniper_alerts/`,
-`positions.json`, and `trade_log.ndjson` — no sockets, no queue.
+### CLI tools
 
 ```bash
-# Daily gem scanner — one-shot, writes report to reports/ and an entry to scanner_history.db
-python solana_gem_scanner.py
-
-# Real-time liftoff sniper — runs continuously, writes alert JSONs to sniper_alerts/
-python liftoff_sniper.py
-python liftoff_sniper.py --once   # single scan and exit
-
-# Auto-trading bot
-python trading_bot.py --dry-run            # default — no real transactions
-python trading_bot.py --live               # real money mode
-python trading_bot.py --status             # show current positions / wallet balance
-python trading_bot.py --buy <CA> 0.01      # manual buy for 0.01 SOL
-python trading_bot.py --sell <CA> 50       # manual sell 50% of position
-python trading_bot.py --withdraw <addr>    # sweep SOL balance to a destination wallet
-
-# Manual token safety check (uses the same 6-layer gate as the bot's pre-buy)
-python safety_module.py <CA>              # legacy check
-python safety_module.py <CA> --full       # full 6-layer check
-
-# Local web dashboard — http://localhost:8420
-python dashboard_local.py
+python solana_gem_scanner.py            # one-shot daily scan
+python trading_bot.py --status          # show open positions
+python trading_bot.py --buy <CA> 0.01   # manual buy
+python trading_bot.py --sell <CA> 50    # sell 50%
+python safety_module.py <CA> --full     # run the 6-layer gate manually
 ```
 
-### Recommended terminal layout for the full pipeline
+---
 
-```
-[Terminal 1]  python liftoff_sniper.py
-[Terminal 2]  python trading_bot.py --dry-run
-[Terminal 3]  python dashboard_local.py     # browser opens automatically
-```
+## What I learned
 
-Stop each component with Ctrl+C. All state is on disk, so safe to restart.
+- **Designing atomic file-based IPC** between independent Python processes
+  — `*.tmp` + `os.replace()`, read-modify-write merges, and graceful
+  recovery from partial writes — turned out to be a surprisingly rich
+  problem once concurrent edits (bot cycle + manual CLI command) entered
+  the picture.
+- **Production deployment pipelines** that go beyond a single script:
+  laptop → GitHub PR → server `git pull` → systemd restart → cron backups
+  → SSH-tunneled monitoring.
+- **Iterative development with Claude Code**, including using a fresh
+  Claude instance to adversarially review the previous one's diff. Several
+  real bugs were caught this way that wouldn't have surfaced from
+  self-review.
+- **Bridging Python REST APIs to a modern TypeScript frontend** — CORS
+  preflight, strict TS hooks over SWR, schema co-design between Flask
+  endpoint and `types/index.ts`.
+- **Trading-bot architecture** — keeping discovery, safety, execution,
+  and monitoring as separable concerns so each can be reasoned about,
+  tested, and replaced independently.
 
-## Pre-live checklist
+---
 
-Before flipping `--live`, audit the open items tracked in conversation history:
+## Project status
 
-- Live transaction confirmation against on-chain balance (do not trust the swap
-  call's `outAmount` as proof of execution)
-- File locking on `positions.json` / `trade_log.ndjson` (or migrate state to SQLite)
-- Crash-recovery mid-sell: write a `pending_sell` marker before `send_transaction`
-- Reconcile any historical positions whose `total_sold_sol` was clamped by the
-  sanity cap — those are estimates, not real outcomes
+- **Mode:** `--dry-run` (the default). Trades are simulated against live
+  market data; no SOL leaves the wallet.
+- **Pre-live blockers tracked** (intentional, not bugs):
+  - Live transaction confirmation against on-chain balance (currently
+    trusts Jupiter's `outAmount` as proof of execution)
+  - File locking on `positions.json` / `trade_log.ndjson` for hardened
+    concurrent access (or a SQLite migration)
+  - Crash-recovery mid-sell: write a `pending_sell` marker before
+    `send_transaction` so reconciliation knows what was in flight
+  - Reconcile historical positions whose `total_sold_sol` was clamped by
+    the implausibility sanity cap — those are estimates, not real outcomes
+- **Dashboard:** functional but deliberately minimal. The current panels
+  (hero metrics, system health, positions, trades, scan-history chart) are
+  the obvious extension points — adding per-position drill-down,
+  configurable score thresholds, or a backtest view would all be
+  reasonable next steps.
 
-## Backups
+---
 
-`backup_data.sh` copies the live state files into a dated subdirectory under
-`backups/` and prunes anything older than 14 days. It is safe to run while the
-bot and sniper are running — each file is a single `cp`, and missing files are
-simply skipped (and noted in `backups/backup.log`).
+## Screenshots
 
-Files backed up:
+_Coming soon — captures of the Next.js dashboard, the CLI status output,
+and the AWS systemd service status._
 
-- `positions.json`
-- `trade_log.ndjson` (or `trade_log.json` if the NDJSON migration has not run yet)
-- `processed_alerts.json`
-- `scanner_history.db`
+---
 
-### Adding to cron (server-side)
+## License / notes
 
-Edit the crontab with `crontab -e` and add:
-
-```cron
-0 3 * * * /home/ubuntu/gem-scanner/backup_data.sh
-```
-
-This runs the backup nightly at 03:00 local time. Verify it ran with
-`tail backups/backup.log` the next morning.
-
-## Files / layout
-
-```
-solana_gem_scanner.py   — daily scanner (DexScreener → reports/ + scanner_history.db)
-liftoff_sniper.py       — continuous monitor (DexScreener → sniper_alerts/)
-trading_bot.py          — auto-trader (sniper_alerts/ → Jupiter → positions.json)
-safety_module.py        — 6-layer pre-buy safety gate + continuous safety checks
-dashboard_local.py      — local web UI on :8420
-db.py                   — SQLite helpers for scanner_history.db
-backup_data.sh          — nightly snapshot of state files → backups/YYYY-MM-DD/
-.env.example            — environment variable template
-requirements.txt        — pinned Python dependencies
-```
-
-## License / use
-
-Personal project. No license granted, no support, no warranty. Trading crypto
-with this code can and will lose money. The default `--dry-run` flag exists
-for a reason — leave it on until you are sure of every line.
+Personal project built as a portfolio piece. Code is shared openly for
+inspection and learning. Trading crypto is risky — this project is in
+**dry-run mode** and is **not financial advice**. If you fork it and flip
+`--live`, you own the consequences.
