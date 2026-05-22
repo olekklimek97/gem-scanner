@@ -14,6 +14,7 @@ Otworzy http://localhost:8420 w przeglądarce.
 import http.server
 import json
 import os
+import time
 import webbrowser
 import threading
 from pathlib import Path
@@ -24,6 +25,98 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from db import get_scan_history, get_scan_details, get_latest_scan
 
 PORT = 8420
+SOL_MINT = "So11111111111111111111111111111111111111111112"
+
+# ─── LIVE PRICE CACHE (best-effort, used by /api/positions for live PnL) ──
+# DexScreener calls are best-effort: 2s timeout, cached for 60s to avoid
+# hammering the API. If the call fails the endpoint falls back to realized
+# PnL computed from sells data only.
+_price_cache: dict[str, tuple[float, float]] = {}  # addr → (price_sol_per_token, expiry_epoch)
+_price_cache_lock = threading.Lock()
+_PRICE_CACHE_TTL_SEC = 60
+_PRICE_FETCH_TIMEOUT_SEC = 2.0
+
+
+def _live_price_sol(token_address: str, pinned_pair: str = "") -> float:
+    """Best-effort live price (in SOL per token) via DexScreener. Returns 0
+    on any failure (caller falls back to realized PnL). Cached 60s."""
+    if not token_address:
+        return 0.0
+    now = time.time()
+    with _price_cache_lock:
+        hit = _price_cache.get(token_address)
+        if hit and hit[1] > now:
+            return hit[0]
+    try:
+        # Lazy import — dashboard should work even if requests isn't installed
+        import requests
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+            headers={"Accept": "application/json", "User-Agent": "DegenBot-Dash/1.0"},
+            timeout=_PRICE_FETCH_TIMEOUT_SEC,
+        )
+        pairs = (r.json() or {}).get("pairs") or []
+        sol_pairs = [p for p in pairs if (p.get("quoteToken") or {}).get("address") == SOL_MINT]
+        if not sol_pairs:
+            return 0.0
+        chosen = None
+        if pinned_pair:
+            for p in sol_pairs:
+                if p.get("pairAddress") == pinned_pair:
+                    chosen = p
+                    break
+        if chosen is None:
+            chosen = max(sol_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0))
+        price_sol = float(chosen.get("priceNative") or 0)
+        with _price_cache_lock:
+            _price_cache[token_address] = (price_sol, now + _PRICE_CACHE_TTL_SEC)
+        return price_sol
+    except Exception:
+        return 0.0
+
+
+def _compute_pnl_pct(pos: dict) -> tuple[float, bool]:
+    """Return (pnl_pct, is_live).
+
+    For closed/dust/stopped positions, pnl_pct = realized = (sold - invested) / invested.
+    For open/partial, attempt to add current value of remaining tokens via DexScreener.
+    On any fetch failure, falls back to realized-only and is_live=False.
+    """
+    invested = float(pos.get("buy_amount_sol", 0) or 0)
+    if invested <= 0:
+        return 0.0, False
+    sold = float(pos.get("total_sold_sol", 0) or 0)
+    status = pos.get("status", "open")
+
+    realized_pct = (sold - invested) / invested * 100.0
+
+    if status in ("closed", "dust", "stopped"):
+        return realized_pct, False
+
+    tokens_remaining = float(pos.get("tokens_remaining", 0) or 0)
+    if tokens_remaining <= 0:
+        return realized_pct, False
+
+    price = _live_price_sol(pos.get("token_address", ""), pos.get("pair_address", ""))
+    if price <= 0:
+        return realized_pct, False
+
+    current_value = tokens_remaining * price
+    total_pct = (sold + current_value - invested) / invested * 100.0
+    return total_pct, True
+
+
+def _hours_since(iso_ts: str) -> float:
+    """Hours between iso_ts and now. Returns 0 if unparseable."""
+    if not iso_ts:
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+    except Exception:
+        return 0.0
 
 HTML = """<!DOCTYPE html>
 <html lang="pl">
@@ -413,9 +506,18 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
 
         if path == '/api/positions':
-            self.send_json(self.load_json('positions.json', []))
+            self.handle_positions()
         elif path == '/api/trades':
-            self.send_json(self.load_trade_log('trade_log.json'))
+            qs = parse_qs(parsed.query)
+            try:
+                limit = int(qs.get('limit', ['50'])[0])
+            except ValueError:
+                limit = 50
+            self.handle_trades(limit)
+        elif path == '/api/system-status':
+            self.handle_system_status()
+        elif path == '/api/metrics-summary':
+            self.handle_metrics_summary()
         elif path == '/api/history':
             qs = parse_qs(parsed.query)
             limit = int(qs.get('limit', ['50'])[0])
@@ -437,6 +539,162 @@ class DashboardHandler(http.server.BaseHTTPRequestHandler):
             self.send_html(HISTORY_HTML)
         else:
             self.send_html(HTML)
+
+    def do_OPTIONS(self):
+        """CORS preflight — Next.js dev server on :3000 may send these."""
+        try:
+            self.send_response(204)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type, Accept')
+            self.send_header('Access-Control-Max-Age', '86400')
+            self.end_headers()
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass
+
+    # ─── New JSON API endpoints (Next.js dashboard) ───
+
+    def handle_positions(self):
+        """Return all positions enriched with computed PnL and time_held.
+        Live unrealized PnL is best-effort via DexScreener (cached 60s)."""
+        try:
+            positions = self.load_json('positions.json', [])
+            out = []
+            for p in positions:
+                pnl_pct, is_live = _compute_pnl_pct(p)
+                out.append({
+                    "token_address": p.get("token_address", ""),
+                    "token_name": p.get("token_name", "?"),
+                    "token_symbol": p.get("token_symbol", "?"),
+                    "buy_amount_sol": float(p.get("buy_amount_sol", 0) or 0),
+                    "buy_time": p.get("buy_time", ""),
+                    "status": p.get("status", "open"),
+                    "cascade_level": int(p.get("cascade_level", 0) or 0),
+                    "score": int(p.get("score", 0) or 0),
+                    "tokens_remaining": float(p.get("tokens_remaining", 0) or 0),
+                    "total_sold_sol": float(p.get("total_sold_sol", 0) or 0),
+                    "sells_count": len(p.get("sells", []) or []),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "pnl_is_live": is_live,
+                    "time_held_hours": round(_hours_since(p.get("buy_time", "")), 2),
+                    "url": p.get("url", ""),
+                })
+            self.send_json(out)
+        except Exception:
+            self.send_json_error(500, f"positions error: {traceback.format_exc()}")
+
+    def handle_trades(self, limit: int):
+        """Return last `limit` trade-log events, most recent first."""
+        try:
+            limit = max(1, min(int(limit), 500))
+            events = self.load_trade_log('trade_log.ndjson')
+            if not events:
+                # Fall back to legacy filename in case the migration hasn't happened
+                events = self.load_trade_log('trade_log.json')
+            # Trade log is appended in chronological order; reverse for newest-first
+            events_reversed = list(reversed(events))
+            self.send_json(events_reversed[:limit])
+        except Exception:
+            self.send_json_error(500, f"trades error: {traceback.format_exc()}")
+
+    def handle_system_status(self):
+        """Quick system snapshot: file counts, latest scan, PnL roll-up."""
+        try:
+            # Sniper alerts
+            alert_dir = Path('sniper_alerts')
+            alert_files = []
+            if alert_dir.exists():
+                alert_files = [f for f in alert_dir.iterdir()
+                               if f.is_file() and f.suffix == '.json'
+                               and not f.name.endswith('.tmp')]
+            last_alert_iso = ""
+            if alert_files:
+                newest = max(alert_files, key=lambda f: f.stat().st_mtime)
+                last_alert_iso = datetime.fromtimestamp(
+                    newest.stat().st_mtime, tz=timezone.utc
+                ).isoformat()
+
+            positions = self.load_json('positions.json', [])
+            open_count = sum(1 for p in positions if p.get('status') == 'open')
+            partial_count = sum(1 for p in positions if p.get('status') == 'partial')
+            dust_count = sum(1 for p in positions if p.get('status') == 'dust')
+
+            # PnL roll-up across realized outcomes
+            total_pnl = 0.0
+            for p in positions:
+                status = p.get('status', '')
+                if status in ('closed', 'partial', 'dust', 'stopped'):
+                    total_pnl += float(p.get('total_sold_sol', 0) or 0) - float(p.get('buy_amount_sol', 0) or 0)
+
+            # Latest scan
+            latest_scan_iso = ""
+            try:
+                latest = get_latest_scan()
+                if latest and latest.get('timestamp'):
+                    latest_scan_iso = latest['timestamp']
+            except Exception:
+                pass
+
+            self.send_json({
+                "sniper_alerts_count": len(alert_files),
+                "last_alert_time": last_alert_iso,
+                "positions_open_count": open_count,
+                "positions_partial_count": partial_count,
+                "positions_dust_count": dust_count,
+                "total_pnl_sol": round(total_pnl, 6),
+                "latest_scan_time": latest_scan_iso,
+            })
+        except Exception:
+            self.send_json_error(500, f"system-status error: {traceback.format_exc()}")
+
+    def handle_metrics_summary(self):
+        """All-time aggregate metrics for the hero section."""
+        try:
+            positions = self.load_json('positions.json', [])
+            total = len(positions)
+            active = sum(1 for p in positions if p.get('status') in ('open', 'partial'))
+            closed = sum(1 for p in positions if p.get('status') == 'closed')
+            dust = sum(1 for p in positions if p.get('status') == 'dust')
+
+            # Win-rate: realized wins / realized exits.
+            # "Realized exit" = closed, dust, stopped (any state with no further movement).
+            # Partial positions are still in play — exclude from win-rate denominator.
+            exited = [p for p in positions if p.get('status') in ('closed', 'dust', 'stopped')]
+            wins = sum(1 for p in exited
+                       if float(p.get('total_sold_sol', 0) or 0) > float(p.get('buy_amount_sol', 0) or 0))
+            win_rate = (wins / len(exited) * 100.0) if exited else 0.0
+
+            # Average hold time across exited positions (uses last sell time if available,
+            # else the buy_time -> now diff which approximates).
+            hold_times = []
+            for p in exited:
+                buy_iso = p.get('buy_time', '')
+                if not buy_iso:
+                    continue
+                sells = p.get('sells', []) or []
+                last_iso = sells[-1].get('time', '') if sells else ''
+                if last_iso:
+                    try:
+                        buy_dt = datetime.fromisoformat(buy_iso.replace("Z", "+00:00"))
+                        sell_dt = datetime.fromisoformat(last_iso.replace("Z", "+00:00"))
+                        hold_times.append((sell_dt - buy_dt).total_seconds() / 3600.0)
+                    except Exception:
+                        pass
+                else:
+                    hold_times.append(_hours_since(buy_iso))
+
+            avg_hold = (sum(hold_times) / len(hold_times)) if hold_times else 0.0
+
+            self.send_json({
+                "total_positions": total,
+                "active_positions": active,
+                "closed_positions": closed,
+                "dust_positions": dust,
+                "win_rate_pct": round(win_rate, 2),
+                "avg_hold_time_hours": round(avg_hold, 2),
+            })
+        except Exception:
+            self.send_json_error(500, f"metrics-summary error: {traceback.format_exc()}")
 
     def do_POST(self):
         parsed = urlparse(self.path)
