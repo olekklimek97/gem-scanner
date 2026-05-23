@@ -434,6 +434,29 @@ def get_dexscreener_price(token_address: str, pinned_pair_address: str = "") -> 
     return 0.0, 0.0, ""
 
 
+def get_dry_run_price(token_address: str, pinned_pair_address: str = "") -> tuple:
+    """Price source used by the dry-run execution path.
+
+    On the AWS deployment Jupiter calls are unreliable (timeouts; possibly
+    rate-limited or blocked at the network layer) which produced positions
+    with buy_amount_tokens=0 and instant dust-close — defeating the purpose
+    of running the bot in dry-run mode at all.
+
+    DexScreener has proven stable from the same host, so dry-run buys and
+    sells use it as the price source. We still go through Jupiter for the
+    *live* execution path (real swaps need Jupiter's routing) and for the
+    safety_module honeypot check (which simulates a sell round-trip via
+    Jupiter to detect transfer-tax / blocked-sell traps).
+
+    Returns (price_sol, price_usd, pair_address_used) — same signature as
+    get_dexscreener_price(). For now this is a thin wrapper so the call
+    sites read clearly; if dry-run pricing ever needs different policy
+    (multiple pair averaging, smoothing, etc.) it can diverge here without
+    touching the on-chain price code path.
+    """
+    return get_dexscreener_price(token_address, pinned_pair_address)
+
+
 # ─── POSITION MANAGEMENT ────────────────────────────────────
 
 class Position:
@@ -717,26 +740,33 @@ def execute_buy(wallet: Wallet, token_address: str, amount_sol: float,
     now_epoch = time.time()
 
     if CONFIG["dry_run"]:
-        print(f"     🧪 DRY RUN — symulacja zakupu")
-        sim_tokens = 0
-        sim_price_sol = 0
-        # Try Jupiter first, fall back to DexScreener
-        quote = get_quote(SOL_MINT, token_address, amount_lamports)
-        # Always pull DexScreener pair info — we need to PIN a pair_address regardless of Jupiter
-        ds_price_sol, ds_price_usd, pinned_pair = get_dexscreener_price(token_address)
-        if quote and int(quote.get("outAmount", 0)) > 0:
-            sim_tokens = int(quote["outAmount"])
-            sim_price_sol = amount_sol / sim_tokens * LAMPORTS_PER_SOL
-            print(f"     📊 Jupiter quote: ~{sim_tokens:,} tokens (pinned pair: {pinned_pair[:8] or 'none'}...)")
-        else:
-            # DexScreener fallback — price per token in SOL
-            if ds_price_sol > 0:
-                sim_tokens = int(amount_sol / ds_price_sol)
-                sim_price_sol = ds_price_sol
-                print(f"     📊 DexScreener price: {ds_price_sol:.10f} SOL/token (${ds_price_usd:.8f})")
-                print(f"     📊 Simulated: ~{sim_tokens:,} tokens (pinned pair: {pinned_pair[:8]}...)")
-            else:
-                print(f"     ⚠️  No price data — position will have no tokens to track")
+        # ── DRY-RUN PRICE SOURCE ──
+        # DexScreener only — Jupiter is unreliable from the AWS host and was
+        # producing buy_amount_tokens=0 positions that immediately dust-closed.
+        # Live execution and the safety honeypot check still use Jupiter; only
+        # the simulation path is changing here.
+        ds_price_sol, ds_price_usd, pinned_pair = get_dry_run_price(token_address)
+        if ds_price_sol <= 0:
+            print(f"     ❌ DRY-RUN BUY ABORTED: no DexScreener SOL-quoted price for "
+                  f"{token_address[:8]}... — skipping (no useless 0-token position created)")
+            return None
+
+        sim_tokens = int(amount_sol / ds_price_sol)
+        if sim_tokens <= 0:
+            # Numerically possible if price_sol is huge (very expensive token vs. tiny buy).
+            # Refuse rather than recording a 0-token position.
+            print(f"     ❌ DRY-RUN BUY ABORTED: computed 0 tokens for "
+                  f"{amount_sol} SOL @ {ds_price_sol:.10f} SOL/token — skipping")
+            return None
+
+        sim_price_sol = ds_price_sol
+
+        # Headline log line — the user reads this to confirm real prices are
+        # flowing through (not Jupiter-fallback garbage).
+        print(f"     🧪 DRY-RUN BUY: {token_name} (CA: {token_address[:8]}...) — "
+              f"simulated {sim_tokens:,} tokens at ${ds_price_usd:.8f} per token "
+              f"({ds_price_sol:.10f} SOL/token, pinned pair {pinned_pair[:8]}...)")
+
         pos = Position({
             "token_address": token_address,
             "token_symbol": token_symbol,
@@ -860,9 +890,11 @@ def execute_sell(wallet: Wallet, position: Position, sell_pct: float, reason: st
 
     if CONFIG["dry_run"]:
         print(f"     🧪 DRY RUN — symulacja sprzedaży")
-        # Calculate simulated SOL received from DexScreener price (re-fetch for freshness, pinned pair)
+        # Use the dry-run price source (DexScreener) — Jupiter is unreliable
+        # on the AWS host. Re-fetch each time so cascade decisions reflect the
+        # current price, not the price at sell-trigger evaluation time.
         sim_sol_out = 0
-        price_sol, _, _ = get_dexscreener_price(position.token_address, pinned)
+        price_sol, _, _ = get_dry_run_price(position.token_address, pinned)
         if price_sol > 0:
             sim_sol_out = tokens_to_sell * price_sol
 
@@ -1288,6 +1320,65 @@ def process_sniper_alerts(wallet: Wallet, pm: PositionManager, trade_log: TradeL
             print(f"     ❌ Error processing {fname}: {e} — will retry next cycle")
 
 
+# ─── MAINTENANCE: PRUNE 0-TOKEN POSITIONS ───────────────────
+
+def cleanup_zero_positions(pm: PositionManager):
+    """Remove positions with buy_amount_tokens == 0 from positions.json.
+
+    These rows are artifacts of the pre-fix dry-run path: Jupiter timeouts
+    on the AWS host produced quote=None → sim_tokens=0 → instant
+    dust-close, leaving useless entries that pollute the dashboard. With
+    the DexScreener-first dry-run path this no longer happens, but the
+    historical entries need a one-shot clean-up.
+
+    Interactive: prints the count and prompts y/N before deleting.
+    """
+    zero_positions = [p for p in pm.positions if getattr(p, "buy_amount_tokens", 0) == 0]
+    count = len(zero_positions)
+
+    if count == 0:
+        print(f"\n  ✅ No zero-token positions found ({len(pm.positions)} total). Nothing to clean up.")
+        return
+
+    print(f"\n  🧹 Found {count} positions with buy_amount_tokens=0 "
+          f"(out of {len(pm.positions)} total).")
+    # Show a sample so the user knows what's about to go
+    for p in zero_positions[:5]:
+        print(f"     · {p.token_name} (${p.token_symbol})  "
+              f"status={p.status}  buy={p.buy_amount_sol} SOL  "
+              f"address={p.token_address[:8]}...")
+    if count > 5:
+        print(f"     · …and {count - 5} more")
+
+    try:
+        answer = input(f"\n  This will remove {count} positions with no recorded "
+                       f"token amounts. Continue? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Aborted.")
+        return
+
+    if answer not in ("y", "yes"):
+        print("  Aborted. No changes made.")
+        return
+
+    # Filter and persist. We bypass pm.save() here because its read-modify-write
+    # merge will defensively re-add disk records that vanished from memory —
+    # which is the right behavior for the runtime bot (don't lose history from a
+    # stale in-memory snapshot) but the wrong behavior for an intentional delete.
+    # Write the filtered list directly with the same atomic-tmp + os.replace
+    # pattern the rest of the codebase uses.
+    kept = [p for p in pm.positions if getattr(p, "buy_amount_tokens", 0) != 0]
+    removed = len(pm.positions) - len(kept)
+    pm.positions = kept
+
+    payload = [p.to_dict() for p in kept]
+    tmp_path = pm.filepath.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(str(tmp_path), str(pm.filepath))
+
+    print(f"  ✅ Removed {removed} zero-token positions. {len(kept)} positions remain.")
+
+
 # ─── STATUS DISPLAY ─────────────────────────────────────────
 
 def show_status(wallet: Optional[Wallet], pm: PositionManager):
@@ -1374,6 +1465,14 @@ def main():
     # ── STATUS ──
     if "--status" in args:
         show_status(wallet, pm)
+        return
+
+    # ── CLEANUP ZERO-TOKEN POSITIONS ──
+    # Maintenance command: prunes positions.json of entries created by the
+    # pre-fix dry-run path (Jupiter timeouts → buy_amount_tokens=0 → instant
+    # dust-close → useless rows polluting the dashboard).
+    if "--cleanup-zero-positions" in args:
+        cleanup_zero_positions(pm)
         return
 
     # ── MANUAL BUY ──
