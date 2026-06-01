@@ -147,6 +147,21 @@ CONFIG = {
 SOL_MINT = "So11111111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
+# Quote-currency mints used by the dry-run pair resolver. Most new pump.fun
+# tokens trade against USDC, not SOL — so an SOL-only filter would block them.
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+USD_STABLE_MINTS = frozenset({USDC_MINT, USDT_MINT})
+
+# Reference pair used to convert USD-quoted prices → SOL-equivalent. This is
+# the Raydium SOL/USDC pool on Solana — the canonical reference. The pair
+# ADDRESS is hardcoded (it doesn't move); the PRICE is always fetched live.
+SOL_USDC_REF_PAIR = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
+_SOL_USD_CACHE = {"price_usd": 0.0, "expires_at": 0.0}
+_SOL_USD_CACHE_TTL_SEC = 300  # 5 minutes — short enough to track market moves,
+                              # long enough to avoid hammering DexScreener on
+                              # every position cycle.
+
 
 # ─── WALLET ─────────────────────────────────────────────────
 
@@ -434,27 +449,137 @@ def get_dexscreener_price(token_address: str, pinned_pair_address: str = "") -> 
     return 0.0, 0.0, ""
 
 
-def get_dry_run_price(token_address: str, pinned_pair_address: str = "") -> tuple:
-    """Price source used by the dry-run execution path.
+def _get_sol_usd_price() -> float:
+    """Cached SOL/USD reference from the Raydium SOL/USDC pool. 5-min TTL.
 
-    On the AWS deployment Jupiter calls are unreliable (timeouts; possibly
-    rate-limited or blocked at the network layer) which produced positions
-    with buy_amount_tokens=0 and instant dust-close — defeating the purpose
-    of running the bot in dry-run mode at all.
-
-    DexScreener has proven stable from the same host, so dry-run buys and
-    sells use it as the price source. We still go through Jupiter for the
-    *live* execution path (real swaps need Jupiter's routing) and for the
-    safety_module honeypot check (which simulates a sell round-trip via
-    Jupiter to detect transfer-tax / blocked-sell traps).
-
-    Returns (price_sol, price_usd, pair_address_used) — same signature as
-    get_dexscreener_price(). For now this is a thin wrapper so the call
-    sites read clearly; if dry-run pricing ever needs different policy
-    (multiple pair averaging, smoothing, etc.) it can diverge here without
-    touching the on-chain price code path.
+    Returns the cached value if fresh. On expiry, refreshes; on fetch failure,
+    falls back to the stale cached value (last known good) rather than 0 so a
+    transient DexScreener blip doesn't break USDC-quoted price conversions.
+    Returns 0.0 only if we've *never* successfully fetched.
     """
-    return get_dexscreener_price(token_address, pinned_pair_address)
+    now = time.time()
+    if _SOL_USD_CACHE["expires_at"] > now and _SOL_USD_CACHE["price_usd"] > 0:
+        return _SOL_USD_CACHE["price_usd"]
+    try:
+        resp = requests.get(
+            f"https://api.dexscreener.com/latest/dex/pairs/solana/{SOL_USDC_REF_PAIR}",
+            headers={"Accept": "application/json", "User-Agent": "DegenBot/1.0"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json() or {}
+        # The /pairs/ endpoint returns either {"pair": {...}} (older shape)
+        # or {"pairs": [{...}]} (newer shape). Accept both.
+        pair = data.get("pair") or (data.get("pairs") or [None])[0]
+        if pair:
+            price_usd = float(pair.get("priceUsd") or 0)
+            if price_usd > 0:
+                _SOL_USD_CACHE["price_usd"] = price_usd
+                _SOL_USD_CACHE["expires_at"] = now + _SOL_USD_CACHE_TTL_SEC
+                return price_usd
+    except Exception as e:
+        print(f"     ⚠️  SOL/USD reference fetch error: {e}")
+    # Fall back to whatever we last had (possibly 0 on first failure)
+    return _SOL_USD_CACHE["price_usd"]
+
+
+def _resolve_dry_run_pair(token_address: str, pinned_pair_address: str = "") -> dict:
+    """Internal helper: look up the dry-run pair and return SOL-equivalent price
+    plus the metadata callers need for logging (quote symbol, dex id, ref price).
+
+    Handles BOTH SOL-quoted and USDC/USDT-quoted pairs. Most new pump.fun tokens
+    only have a USDC pool at launch, so the previous SOL-only filter was
+    rejecting every buy in dry-run.
+
+    Returns a dict with these keys (zeros on failure):
+        price_sol      — SOL per token (converted from USD if needed)
+        price_usd      — USD per token (from DexScreener directly)
+        pair_address   — the pair actually used
+        quote_symbol   — "SOL", "USDC", "USDT", … (for log lines)
+        dex_id         — "raydium", "orca", "meteora", … (for log lines)
+        sol_usd_ref    — the SOL/USD price used for conversion (0 for SOL-quoted)
+    """
+    info = {
+        "price_sol": 0.0, "price_usd": 0.0, "pair_address": "",
+        "quote_symbol": "", "dex_id": "", "sol_usd_ref": 0.0,
+    }
+    try:
+        resp = requests.get(
+            f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
+            headers={"Accept": "application/json", "User-Agent": "DegenBot/1.0"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        pairs = (resp.json() or {}).get("pairs") or []
+    except Exception as e:
+        print(f"     ⚠️  DexScreener fetch error: {e}")
+        return info
+
+    if not pairs:
+        return info
+
+    # Solana chain only, with non-zero liquidity (dead pairs report stale prices)
+    live_pairs = [
+        p for p in pairs
+        if p.get("chainId") == "solana"
+        and ((p.get("liquidity") or {}).get("usd", 0) or 0) > 0
+    ]
+    if not live_pairs:
+        return info
+
+    # Prefer the pinned pair if it's still live — keeps PnL math consistent
+    # across cycles. Otherwise pick the deepest liquidity.
+    chosen = None
+    if pinned_pair_address:
+        for p in live_pairs:
+            if p.get("pairAddress", "") == pinned_pair_address:
+                chosen = p
+                break
+    if chosen is None:
+        chosen = max(live_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0))
+
+    quote_addr = (chosen.get("quoteToken") or {}).get("address", "")
+    info["pair_address"] = chosen.get("pairAddress", "")
+    info["quote_symbol"] = (chosen.get("quoteToken") or {}).get("symbol", "?")
+    info["dex_id"] = chosen.get("dexId", "?")
+    info["price_usd"] = float(chosen.get("priceUsd") or 0)
+    price_native = float(chosen.get("priceNative") or 0)
+
+    if quote_addr == SOL_MINT:
+        # SOL-quoted: priceNative IS SOL per token; no conversion needed.
+        if price_native > 0:
+            info["price_sol"] = price_native
+        return info
+
+    # Non-SOL quote (USDC/USDT, and as a fallback any other quote where DexScreener
+    # gives us a non-zero priceUsd we can trust). Convert via the SOL/USDC ref.
+    if info["price_usd"] <= 0:
+        return info
+    sol_usd = _get_sol_usd_price()
+    info["sol_usd_ref"] = sol_usd
+    if sol_usd <= 0:
+        print(f"     ⚠️  SOL/USD reference unavailable; cannot convert "
+              f"{info['quote_symbol']}-quoted price for {token_address[:8]}...")
+        return info
+    if quote_addr not in USD_STABLE_MINTS:
+        # Exotic quote — log it so we know what was used. Still safe to convert
+        # via priceUsd since DexScreener has already done its own conversion.
+        print(f"     ℹ️  Non-stable quote {info['quote_symbol']} for "
+              f"{token_address[:8]}...; using priceUsd → SOL via ref")
+    info["price_sol"] = info["price_usd"] / sol_usd
+    return info
+
+
+def get_dry_run_price(token_address: str, pinned_pair_address: str = "") -> tuple:
+    """Backward-compatible wrapper around _resolve_dry_run_pair().
+
+    Returns (price_sol, price_usd, pair_address_used) — same 3-tuple shape as
+    get_dexscreener_price() so existing callers (e.g. execute_sell) keep working.
+    For richer metadata (quote_symbol, dex_id, sol_usd_ref) used in execute_buy's
+    log line, call _resolve_dry_run_pair() directly.
+    """
+    info = _resolve_dry_run_pair(token_address, pinned_pair_address)
+    return info["price_sol"], info["price_usd"], info["pair_address"]
 
 
 # ─── POSITION MANAGEMENT ────────────────────────────────────
@@ -741,13 +866,20 @@ def execute_buy(wallet: Wallet, token_address: str, amount_sol: float,
 
     if CONFIG["dry_run"]:
         # ── DRY-RUN PRICE SOURCE ──
-        # DexScreener only — Jupiter is unreliable from the AWS host and was
-        # producing buy_amount_tokens=0 positions that immediately dust-closed.
-        # Live execution and the safety honeypot check still use Jupiter; only
-        # the simulation path is changing here.
-        ds_price_sol, ds_price_usd, pinned_pair = get_dry_run_price(token_address)
+        # DexScreener handles both SOL- and USDC-quoted pairs (most pump.fun
+        # tokens are USDC-quoted at launch). _resolve_dry_run_pair returns rich
+        # metadata so we can log quote currency + DEX. Jupiter stays for live
+        # execution and for the safety honeypot check.
+        price_info = _resolve_dry_run_pair(token_address)
+        ds_price_sol = price_info["price_sol"]
+        ds_price_usd = price_info["price_usd"]
+        pinned_pair = price_info["pair_address"]
+        quote_symbol = price_info["quote_symbol"] or "?"
+        dex_id = price_info["dex_id"] or "?"
+        sol_usd_ref = price_info["sol_usd_ref"]
+
         if ds_price_sol <= 0:
-            print(f"     ❌ DRY-RUN BUY ABORTED: no DexScreener SOL-quoted price for "
+            print(f"     ❌ DRY-RUN BUY ABORTED: no usable DexScreener price for "
                   f"{token_address[:8]}... — skipping (no useless 0-token position created)")
             return None
 
@@ -756,16 +888,22 @@ def execute_buy(wallet: Wallet, token_address: str, amount_sol: float,
             # Numerically possible if price_sol is huge (very expensive token vs. tiny buy).
             # Refuse rather than recording a 0-token position.
             print(f"     ❌ DRY-RUN BUY ABORTED: computed 0 tokens for "
-                  f"{amount_sol} SOL @ {ds_price_sol:.10f} SOL/token — skipping")
+                  f"{amount_sol} SOL @ {ds_price_sol:.10f} SOL/token "
+                  f"(quote: {quote_symbol} via {dex_id}) — skipping")
             return None
 
         sim_price_sol = ds_price_sol
 
-        # Headline log line — the user reads this to confirm real prices are
-        # flowing through (not Jupiter-fallback garbage).
+        # Headline log line — exposes quote currency so we can see at a glance
+        # whether the simulated buy used the SOL pool or a USDC conversion.
+        if sol_usd_ref > 0:
+            quote_suffix = (f"(quote: {quote_symbol} via {dex_id}, "
+                            f"SOL/USDC ref: ${sol_usd_ref:.2f})")
+        else:
+            quote_suffix = f"(quote: {quote_symbol} via {dex_id})"
         print(f"     🧪 DRY-RUN BUY: {token_name} (CA: {token_address[:8]}...) — "
               f"simulated {sim_tokens:,} tokens at ${ds_price_usd:.8f} per token "
-              f"({ds_price_sol:.10f} SOL/token, pinned pair {pinned_pair[:8]}...)")
+              f"{quote_suffix}")
 
         pos = Position({
             "token_address": token_address,
