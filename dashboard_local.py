@@ -26,6 +26,13 @@ from db import get_scan_history, get_scan_details, get_latest_scan
 
 PORT = 8420
 SOL_MINT = "So11111111111111111111111111111111111111111112"
+# H-3: USDC/USDT mints + SOL/USDC ref pair, mirroring trading_bot.py so the
+# dashboard can convert USDC-quoted prices to SOL-equivalent without depending
+# on trading_bot's runtime state.
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT_MINT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+USD_STABLE_MINTS = frozenset({USDC_MINT, USDT_MINT})
+SOL_USDC_REF_PAIR = "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"
 
 # ─── LIVE PRICE CACHE (best-effort, used by /api/positions for live PnL) ──
 # DexScreener calls are best-effort: 2s timeout, cached for 60s to avoid
@@ -36,10 +43,54 @@ _price_cache_lock = threading.Lock()
 _PRICE_CACHE_TTL_SEC = 60
 _PRICE_FETCH_TIMEOUT_SEC = 2.0
 
+# H-3: SOL/USD reference cache for converting USDC-quoted positions.
+# 5-minute TTL — same as trading_bot._SOL_USD_CACHE. We intentionally keep a
+# separate cache to avoid coupling to the trader process.
+_sol_usd_cache = {"price_usd": 0.0, "expires_at": 0.0}
+_sol_usd_cache_lock = threading.Lock()
+_SOL_USD_TTL_SEC = 300
+
+
+def _dash_get_sol_usd_price() -> float:
+    """Best-effort SOL/USD reference via Raydium SOL/USDC pool. Returns 0
+    on any failure (caller falls back to realized PnL)."""
+    now = time.time()
+    with _sol_usd_cache_lock:
+        if _sol_usd_cache["expires_at"] > now and _sol_usd_cache["price_usd"] > 0:
+            return _sol_usd_cache["price_usd"]
+    try:
+        import requests
+        r = requests.get(
+            f"https://api.dexscreener.com/latest/dex/pairs/solana/{SOL_USDC_REF_PAIR}",
+            headers={"Accept": "application/json", "User-Agent": "DegenBot-Dash/1.0"},
+            timeout=_PRICE_FETCH_TIMEOUT_SEC,
+        )
+        data = r.json() or {}
+        pair = data.get("pair") or (data.get("pairs") or [None])[0]
+        if pair:
+            p = float(pair.get("priceUsd") or 0)
+            if p > 0:
+                with _sol_usd_cache_lock:
+                    _sol_usd_cache["price_usd"] = p
+                    _sol_usd_cache["expires_at"] = now + _SOL_USD_TTL_SEC
+                return p
+    except Exception:
+        pass
+    # Stale-cache fallback so a transient blip doesn't break USDC PnL.
+    return _sol_usd_cache["price_usd"]
+
 
 def _live_price_sol(token_address: str, pinned_pair: str = "") -> float:
-    """Best-effort live price (in SOL per token) via DexScreener. Returns 0
-    on any failure (caller falls back to realized PnL). Cached 60s."""
+    """Best-effort live price (in SOL per token) via DexScreener.
+
+    H-3: handles BOTH SOL-quoted and USDC/USDT-quoted pairs. For non-SOL
+    quotes, converts priceUsd → SOL via the SOL/USDC reference. Mirrors the
+    trading_bot._resolve_dry_run_pair behavior so dashboard PnL is correct
+    for the USDC-quoted pump.fun positions that make up most of our flow.
+
+    Returns 0 on any failure (caller falls back to realized PnL). Cached 60s
+    per token; SOL/USDC ref cached 5 min separately.
+    """
     if not token_address:
         return 0.0
     now = time.time()
@@ -56,18 +107,39 @@ def _live_price_sol(token_address: str, pinned_pair: str = "") -> float:
             timeout=_PRICE_FETCH_TIMEOUT_SEC,
         )
         pairs = (r.json() or {}).get("pairs") or []
-        sol_pairs = [p for p in pairs if (p.get("quoteToken") or {}).get("address") == SOL_MINT]
-        if not sol_pairs:
+        # Solana chain only, non-zero liquidity. NO SOL-quote filter — we
+        # handle USDC/USDT below via the reference price.
+        live_pairs = [
+            p for p in pairs
+            if p.get("chainId") == "solana"
+            and ((p.get("liquidity") or {}).get("usd", 0) or 0) > 0
+        ]
+        if not live_pairs:
             return 0.0
         chosen = None
         if pinned_pair:
-            for p in sol_pairs:
+            for p in live_pairs:
                 if p.get("pairAddress") == pinned_pair:
                     chosen = p
                     break
         if chosen is None:
-            chosen = max(sol_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0))
-        price_sol = float(chosen.get("priceNative") or 0)
+            chosen = max(live_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0))
+
+        quote_addr = (chosen.get("quoteToken") or {}).get("address", "")
+        price_native = float(chosen.get("priceNative") or 0)
+        price_usd = float(chosen.get("priceUsd") or 0)
+
+        if quote_addr == SOL_MINT:
+            price_sol = price_native if price_native > 0 else 0.0
+        elif price_usd > 0:
+            # USDC/USDT (or any non-SOL with valid priceUsd) — convert via ref
+            sol_usd = _dash_get_sol_usd_price()
+            if sol_usd <= 0:
+                return 0.0  # can't convert; caller falls back to realized
+            price_sol = price_usd / sol_usd
+        else:
+            return 0.0
+
         with _price_cache_lock:
             _price_cache[token_address] = (price_sol, now + _PRICE_CACHE_TTL_SEC)
         return price_sol
