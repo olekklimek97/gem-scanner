@@ -54,6 +54,80 @@ except ImportError:
     print("  Place safety_module.py in the same folder as trading_bot.py")
 
 
+def _log_terminal_transition_if_needed(trade_log, position, status_before: str, reason: str):
+    """Emit a structured trade-log event when a sell flips a position into a
+    special terminal state ("rugged" from C-5 drained pool, "suspect" from the
+    100x implausibility guard). The 24h summary at startup counts these.
+
+    No-op if trade_log is None, if the status didn't actually transition into
+    one of the special states, or if it was already in that state before."""
+    if trade_log is None:
+        return
+    after = getattr(position, "status", "")
+    if after not in ("rugged", "suspect"):
+        return
+    if status_before == after:
+        # Already in this state — don't re-log on subsequent cycles.
+        return
+    try:
+        action = "position_rugged" if after == "rugged" else "position_suspect"
+        trade_log.log({
+            "action": action,
+            "token": getattr(position, "token_symbol", "?"),
+            "token_address": getattr(position, "token_address", ""),
+            "status_before": status_before,
+            "status_after": after,
+            "trigger_reason": reason,
+            "buy_amount_sol": getattr(position, "buy_amount_sol", 0),
+            "total_sold_sol": getattr(position, "total_sold_sol", 0),
+        })
+    except Exception as e:
+        print(f"     ⚠️  Could not log terminal transition: {e}")
+
+
+def _print_24h_summary(trade_log) -> None:
+    """Print a one-line summary of safety-related refusals in the last 24h.
+
+    Counts:
+      - buy_refused events with sim_honeypot_unverified=True (C-4)
+      - buy_refused events with sim_rugcheck_unavailable=True (H-4)
+      - position_rugged events (C-5 drained-pool transitions)
+      - position_suspect events (100x implausibility guard transitions)
+
+    Safe to call before main loop start; no-op if trade_log is empty / unreadable.
+    """
+    try:
+        events = trade_log.read_all()
+    except Exception as e:
+        print(f"  ⚠️  Could not read trade log for 24h summary: {e}")
+        return
+
+    if not events:
+        print(f"  📊 Last 24h: trade log empty (fresh bot)")
+        return
+
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    recent = [e for e in events if isinstance(e, dict) and e.get("timestamp", "") >= cutoff_iso]
+
+    hp_refused = sum(
+        1 for e in recent
+        if e.get("action") == "buy_refused" and e.get("sim_honeypot_unverified")
+    )
+    rc_refused = sum(
+        1 for e in recent
+        if e.get("action") == "buy_refused" and e.get("sim_rugcheck_unavailable")
+    )
+    rugged = sum(1 for e in recent if e.get("action") == "position_rugged")
+    suspect = sum(1 for e in recent if e.get("action") == "position_suspect")
+    buys = sum(1 for e in recent if e.get("action") == "buy")
+
+    print(f"  📊 Last 24h: {buys} buys executed, "
+          f"{hp_refused} refused (honeypot unverified), "
+          f"{rc_refused} refused (rugcheck unavailable), "
+          f"{rugged} positions marked rugged"
+          + (f", {suspect} marked suspect" if suspect else ""))
+
+
 def log_safety_event(trade_log, event: str, position, details: dict):
     """Record a safety event in trade_log.json for the dashboard."""
     try:
@@ -957,8 +1031,14 @@ class TradeLog:
 
 def execute_buy(wallet: Wallet, token_address: str, amount_sol: float,
                 token_name: str = "?", token_symbol: str = "?",
-                score: int = 0, url: str = "") -> Optional[Position]:
-    """Buy a token."""
+                score: int = 0, url: str = "",
+                trade_log: Optional["TradeLog"] = None) -> Optional[Position]:
+    """Buy a token.
+
+    `trade_log` (optional): when provided, refusals are logged as
+    `buy_refused` events with the safety_module's diagnostic tags
+    (sim_honeypot_unverified, sim_rugcheck_unavailable, …) so post-hoc
+    analysis can count failure modes."""
     amount_lamports = int(amount_sol * LAMPORTS_PER_SOL)
 
     print(f"\n  🛒 BUYING {token_name} (${token_symbol})")
@@ -982,6 +1062,21 @@ def execute_buy(wallet: Wallet, token_address: str, amount_sol: float,
                 print(f"     ❌ Buy refused: RugCheck unavailable "
                       f"— conservative dry-run posture (H-4)")
             print(f"     ❌ SAFETY CHECK FAILED — blocking: {full_report['blocking_reasons']}")
+            # Structured refusal log so the 24h summary / dashboards can count.
+            if trade_log is not None:
+                try:
+                    trade_log.log({
+                        "action": "buy_refused",
+                        "token": token_symbol,
+                        "token_address": token_address,
+                        "amount_sol_proposed": amount_sol,
+                        "score": score,
+                        "reasons": full_report["blocking_reasons"],
+                        "sim_honeypot_unverified": bool(full_report.get("sim_honeypot_unverified")),
+                        "sim_rugcheck_unavailable": bool(full_report.get("sim_rugcheck_unavailable")),
+                    })
+                except Exception as e:
+                    print(f"     ⚠️  Could not log buy_refused event: {e}")
             return None
         print(f"     ✅ Full safety check passed (score: {full_report['score']}/100)")
     else:
@@ -1164,10 +1259,19 @@ def execute_buy(wallet: Wallet, token_address: str, amount_sol: float,
     return pos
 
 
-def execute_sell(wallet: Wallet, position: Position, sell_pct: float, reason: str = "") -> bool:
+def execute_sell(wallet: Wallet, position: Position, sell_pct: float,
+                 reason: str = "",
+                 trade_log: Optional["TradeLog"] = None) -> bool:
     """Sell a percentage of position. Falls back to selling everything as 'dust'
     if the requested amount is too small to actually move tokens or is below the
-    fee-recovery threshold."""
+    fee-recovery threshold.
+
+    `trade_log` (optional): when provided, terminal-status transitions to
+    "rugged" (C-5 drained pool) or "suspect" (100x implausibility guard) are
+    logged as separate structured events so the 24h summary can count them."""
+    # Snapshot status BEFORE sell so we can detect transitions even though the
+    # caller logs its own action event afterward.
+    status_before = position.status
     requested = int(position.tokens_remaining * (sell_pct / 100))
     tokens_to_sell = requested
 
@@ -1295,6 +1399,7 @@ def execute_sell(wallet: Wallet, position: Position, sell_pct: float, reason: st
             "tx": "DRY_RUN",
             "time": datetime.now(timezone.utc).isoformat(),
         })
+        _log_terminal_transition_if_needed(trade_log, position, status_before, reason)
         return True
 
     # 1. Quote
@@ -1346,7 +1451,7 @@ def execute_sell(wallet: Wallet, position: Position, sell_pct: float, reason: st
         "tx": signature,
         "time": datetime.now(timezone.utc).isoformat(),
     })
-
+    _log_terminal_transition_if_needed(trade_log, position, status_before, reason)
     return True
 
 
@@ -1431,7 +1536,8 @@ def check_positions(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
                         "liquidity": cont.get("liquidity"),
                         "mint": cont.get("mint"),
                     })
-                    if execute_sell(wallet, pos, 100, f"EMERGENCY: {reasons[:80]}"):
+                    if execute_sell(wallet, pos, 100, f"EMERGENCY: {reasons[:80]}",
+                                    trade_log=trade_log):
                         trade_log.log({
                             "action": "emergency_sell",
                             "token": pos.token_symbol,
@@ -1511,7 +1617,9 @@ def check_positions(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
             sell_pct = min(95, (tokens_for_investment / pos.tokens_remaining) * 100)
 
             print(f"     🎯 TAKE PROFIT #1! Price +{price_change_pct:.0f}% — selling {sell_pct:.0f}% to recover investment")
-            if execute_sell(wallet, pos, sell_pct, f"TP1: recover investment at price +{price_change_pct:.0f}%"):
+            if execute_sell(wallet, pos, sell_pct,
+                            f"TP1: recover investment at price +{price_change_pct:.0f}%",
+                            trade_log=trade_log):
                 pos.cascade_level = 1
                 pos.peak_pnl_pct = max(pos.peak_pnl_pct, pnl_pct)
                 trade_log.log({
@@ -1535,7 +1643,9 @@ def check_positions(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
                     sell_pct = c["moonbag_sell_pct"] * 100  # fraction → percentage
                     next_level = pos.cascade_level + 1
                     print(f"     🚀 CASCADE #{next_level}! Price +{price_change_pct:.0f}% (threshold +{next_cascade_pct:.0f}%) — selling {sell_pct:.0f}% of remaining")
-                    if execute_sell(wallet, pos, sell_pct, f"Cascade #{next_level} at price +{price_change_pct:.0f}%"):
+                    if execute_sell(wallet, pos, sell_pct,
+                                    f"Cascade #{next_level} at price +{price_change_pct:.0f}%",
+                                    trade_log=trade_log):
                         pos.cascade_level = next_level
                         pos.peak_pnl_pct = max(pos.peak_pnl_pct, pnl_pct)
                         trade_log.log({
@@ -1551,7 +1661,8 @@ def check_positions(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
         # ── STOP LOSS (still PnL-based, only active before TP1) ──
         if pnl_pct <= c["stop_loss_pct"] and pos.cascade_level == 0:
             print(f"     🛑 STOP LOSS! Bag PnL {pnl_pct:.0f}% — selling everything")
-            if execute_sell(wallet, pos, 100, f"SL at PnL {pnl_pct:.0f}%"):
+            if execute_sell(wallet, pos, 100, f"SL at PnL {pnl_pct:.0f}%",
+                            trade_log=trade_log):
                 trade_log.log({
                     "action": "stop_loss", "token": pos.token_symbol,
                     "pnl_pct": pnl_pct,
@@ -1658,6 +1769,7 @@ def process_sniper_alerts(wallet: Wallet, pm: PositionManager, trade_log: TradeL
                     token_symbol=det.get("token_symbol", "?"),
                     score=score,
                     url=det.get("url", ""),
+                    trade_log=trade_log,
                 )
 
                 if pos:
@@ -1849,7 +1961,7 @@ def main():
             print("  ❌ Wallet nie skonfigurowany!")
             return
 
-        pos = execute_buy(wallet, token_addr, amount_sol)
+        pos = execute_buy(wallet, token_addr, amount_sol, trade_log=trade_log)
         if pos:
             pm.add(pos)
             trade_log.log({"action": "manual_buy", "token": pos.token_symbol, "amount_sol": amount_sol})
@@ -1874,7 +1986,7 @@ def main():
             print(f"  ❌ Nie znaleziono pozycji dla {token_addr}")
             return
 
-        if execute_sell(wallet, pos, sell_pct, "Manual sell"):
+        if execute_sell(wallet, pos, sell_pct, "Manual sell", trade_log=trade_log):
             pm.save()
             trade_log.log({"action": "manual_sell", "token": pos.token_symbol, "sell_pct": sell_pct})
             print("  ✅ Sprzedaż wykonana!")
@@ -1987,6 +2099,10 @@ def main():
 
     if wallet and wallet.ready:
         show_status(wallet, pm)
+
+    # 24h diagnostic summary — surfaces honeypot-unverified / rugcheck-unavailable
+    # refusals and drained-pool ruggings so the operator can see API health at a glance.
+    _print_24h_summary(trade_log)
 
     print(f"  🚀 Startuje auto-mode. Ctrl+C aby zatrzymać.")
     print(f"  📂 Czekam na alerty z Liftoff Sniper w sniper_alerts/")
