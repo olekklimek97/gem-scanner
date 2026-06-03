@@ -352,11 +352,17 @@ def _parse_rugcheck_report(data: dict, result: dict):
 
 # ─── COMBINED SAFETY GATE ───────────────────────────────────
 
-def run_safety_check(token_address: str) -> SafetyReport:
+def run_safety_check(token_address: str, is_dry_run: bool = False) -> SafetyReport:
     """
     Run all safety checks. Returns SafetyReport with pass/fail.
     This is the main function called by trading_bot.py before buying.
+
+    `is_dry_run`: reserved for the conservative-posture flag used by C-4/H-4
+    in run_full_safety_check. The legacy single-call path doesn't currently
+    use it — the per-layer adjustments happen in run_full_safety_check after
+    aggregation. Kept here for signature consistency.
     """
+    _ = is_dry_run  # see docstring — handled at the aggregation layer
     report = SafetyReport(token_address=token_address)
     score = 0
 
@@ -384,6 +390,21 @@ def run_safety_check(token_address: str) -> SafetyReport:
 
     if rc["error"]:
         report.errors.append(rc["error"])
+        # H-4: In dry-run, treat RugCheck failure as a hard fail. Without this
+        # the legacy gate's mint/freeze/holder hard-fail checks (which key on
+        # `is False` / `> threshold`) all stay False because the fields default
+        # to None / 0.0. Combined with C-4 (Jupiter down), the gate degenerates
+        # to `score >= 30` which is trivially passable. Live mode is unchanged
+        # — operator may want manual override.
+        if is_dry_run:
+            report.mint_revoked = False
+            report.freeze_revoked = False
+            report.top10_holder_pct = 100.0
+            report.top20_holder_pct = 100.0
+            report.warnings.append(
+                "DRY-RUN: RugCheck unavailable — fields forced to failing values"
+            )
+            score -= 50  # force the overall score down so even soft checks fail
     else:
         # Mint authority
         report.mint_revoked = rc["mint_revoked"]
@@ -1159,11 +1180,18 @@ def check_deployer(token_address: str) -> dict:
 
 # ─── UPGRADED PRE-BUY GATE ─────────────────────────────────
 
-def run_full_safety_check(token_address: str) -> dict:
-    """Run legacy SafetyReport + all new layers. Returns detailed dict report."""
+def run_full_safety_check(token_address: str, is_dry_run: bool = False) -> dict:
+    """Run legacy SafetyReport + all new layers. Returns detailed dict report.
+
+    `is_dry_run`: when True, applies a CONSERVATIVE posture for inconclusive
+    safety layers. Specifically (C-4), when Jupiter is unreachable both honeypot
+    layers return inconclusive (honeypot_safe=None and multi-amount ok=False);
+    in dry-run we treat that as a HARD BLOCK because we can't simulate real
+    sells reliably. Live mode is unchanged — operator may want manual override.
+    """
     print(f"  🛡️ Running FULL safety check on {token_address[:12]}...")
 
-    legacy = run_safety_check(token_address)
+    legacy = run_safety_check(token_address, is_dry_run=is_dry_run)
     legacy_dict = {
         "passed": legacy.passed,
         "score": legacy.score,
@@ -1248,6 +1276,40 @@ def run_full_safety_check(token_address: str) -> dict:
     if dp.get("is_whitelisted_launchpad"):
         report["score"] = min(100, report["score"] + 10)
         report["launchpad_boost"] = dp.get("launchpad_label", "")
+
+    # ── C-4: DRY-RUN HONEYPOT CONSERVATIVE POSTURE ──
+    # When Jupiter is unreachable, both honeypot layers return inconclusive:
+    #   - check_honeypot (legacy):       safe=None  → just a warning, no penalty
+    #   - honeypot_check_multi_amount:    ok=False, passed=False → aggregation
+    #     above only blocks when ok=True AND not passed, so inconclusive slips
+    #     through. Result: dry-run "buys" tokens we cannot actually sell.
+    # In dry-run we treat both-inconclusive as a HARD BLOCK with a clear tag
+    # so post-hoc analysis can identify these positions. Live mode unchanged.
+    if is_dry_run:
+        hp_legacy_inconclusive = legacy.honeypot_safe is None
+        hp_multi_inconclusive = not hp.get("ok", False)
+        if hp_legacy_inconclusive and hp_multi_inconclusive:
+            report["passed"] = False
+            report["sim_honeypot_unverified"] = True
+            report["blocking_reasons"].append(
+                "sim_honeypot_unverified(jupiter_breaker_open)"
+            )
+
+        # ── H-4: DRY-RUN RUGCHECK CONSERVATIVE POSTURE ──
+        # The legacy gate already forced mint/freeze/holders to failing values
+        # when RugCheck errored (above), which causes legacy_safety_failed to
+        # propagate here. We also emit a clear, structured tag so post-hoc
+        # analysis can distinguish RugCheck-unavailable blocks from other
+        # gate failures.
+        rugcheck_failed = any(
+            "RugCheck" in (e or "") or "rugcheck" in (e or "").lower()
+            for e in legacy.errors
+        )
+        if rugcheck_failed:
+            report["passed"] = False
+            report["sim_rugcheck_unavailable"] = True
+            if "rugcheck_unavailable" not in report["blocking_reasons"]:
+                report["blocking_reasons"].append("rugcheck_unavailable")
 
     return report
 

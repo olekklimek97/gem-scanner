@@ -54,6 +54,80 @@ except ImportError:
     print("  Place safety_module.py in the same folder as trading_bot.py")
 
 
+def _log_terminal_transition_if_needed(trade_log, position, status_before: str, reason: str):
+    """Emit a structured trade-log event when a sell flips a position into a
+    special terminal state ("rugged" from C-5 drained pool, "suspect" from the
+    100x implausibility guard). The 24h summary at startup counts these.
+
+    No-op if trade_log is None, if the status didn't actually transition into
+    one of the special states, or if it was already in that state before."""
+    if trade_log is None:
+        return
+    after = getattr(position, "status", "")
+    if after not in ("rugged", "suspect"):
+        return
+    if status_before == after:
+        # Already in this state — don't re-log on subsequent cycles.
+        return
+    try:
+        action = "position_rugged" if after == "rugged" else "position_suspect"
+        trade_log.log({
+            "action": action,
+            "token": getattr(position, "token_symbol", "?"),
+            "token_address": getattr(position, "token_address", ""),
+            "status_before": status_before,
+            "status_after": after,
+            "trigger_reason": reason,
+            "buy_amount_sol": getattr(position, "buy_amount_sol", 0),
+            "total_sold_sol": getattr(position, "total_sold_sol", 0),
+        })
+    except Exception as e:
+        print(f"     ⚠️  Could not log terminal transition: {e}")
+
+
+def _print_24h_summary(trade_log) -> None:
+    """Print a one-line summary of safety-related refusals in the last 24h.
+
+    Counts:
+      - buy_refused events with sim_honeypot_unverified=True (C-4)
+      - buy_refused events with sim_rugcheck_unavailable=True (H-4)
+      - position_rugged events (C-5 drained-pool transitions)
+      - position_suspect events (100x implausibility guard transitions)
+
+    Safe to call before main loop start; no-op if trade_log is empty / unreadable.
+    """
+    try:
+        events = trade_log.read_all()
+    except Exception as e:
+        print(f"  ⚠️  Could not read trade log for 24h summary: {e}")
+        return
+
+    if not events:
+        print(f"  📊 Last 24h: trade log empty (fresh bot)")
+        return
+
+    cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    recent = [e for e in events if isinstance(e, dict) and e.get("timestamp", "") >= cutoff_iso]
+
+    hp_refused = sum(
+        1 for e in recent
+        if e.get("action") == "buy_refused" and e.get("sim_honeypot_unverified")
+    )
+    rc_refused = sum(
+        1 for e in recent
+        if e.get("action") == "buy_refused" and e.get("sim_rugcheck_unavailable")
+    )
+    rugged = sum(1 for e in recent if e.get("action") == "position_rugged")
+    suspect = sum(1 for e in recent if e.get("action") == "position_suspect")
+    buys = sum(1 for e in recent if e.get("action") == "buy")
+
+    print(f"  📊 Last 24h: {buys} buys executed, "
+          f"{hp_refused} refused (honeypot unverified), "
+          f"{rc_refused} refused (rugcheck unavailable), "
+          f"{rugged} positions marked rugged"
+          + (f", {suspect} marked suspect" if suspect else ""))
+
+
 def log_safety_event(trade_log, event: str, position, details: dict):
     """Record a safety event in trade_log.json for the dashboard."""
     try:
@@ -141,6 +215,25 @@ CONFIG = {
 
     # ── Safety ──
     "dry_run": True,                   # DOMYŚLNIE True — musisz wyłączyć jawnie: --live
+
+    # ── Dry-run realism parameters (C-2, C-3) ──
+    # Applied only in dry-run code paths. Live mode uses Jupiter's actual fees
+    # baked into the quote and pays real on-chain costs.
+    "jupiter_fee_pct": 0.0085,         # Jupiter's blended platform fee (0.85%)
+    "network_fee_sol": 0.000115,       # base sig (5k) + priority (100k) + Jito tip (10k) in SOL
+
+    # ── Drained pool guard (C-5) ──
+    # Below this liquidity, the pool has effectively no counterparty. The
+    # stale DexScreener priceNative cannot be honored on-chain. Dry-run
+    # records 0 proceeds and marks position as "rugged" (vs "closed"/"dust").
+    "drained_pool_threshold_usd": 500,
+
+    # ── Fill simulation timing (H-1) ──
+    # Real live: trigger-detection → quote → submit → confirm takes 10-40s,
+    # during which memecoin price moves 5-15%. We sample twice with this
+    # delay and use the worse price (lower for sells, higher for buys) to
+    # model the submit→confirm window. Set to 0 in tests to skip the wait.
+    "fill_delay_sec": 8,
 }
 
 # Solana constants
@@ -502,6 +595,9 @@ def _resolve_dry_run_pair(token_address: str, pinned_pair_address: str = "") -> 
     info = {
         "price_sol": 0.0, "price_usd": 0.0, "pair_address": "",
         "quote_symbol": "", "dex_id": "", "sol_usd_ref": 0.0,
+        # C-1: chosen pair's liquidity (USD) — used by slippage model.
+        # Zero on failure paths or when no chosen pair.
+        "liquidity_usd": 0.0,
     }
     try:
         resp = requests.get(
@@ -543,6 +639,7 @@ def _resolve_dry_run_pair(token_address: str, pinned_pair_address: str = "") -> 
     info["quote_symbol"] = (chosen.get("quoteToken") or {}).get("symbol", "?")
     info["dex_id"] = chosen.get("dexId", "?")
     info["price_usd"] = float(chosen.get("priceUsd") or 0)
+    info["liquidity_usd"] = float((chosen.get("liquidity") or {}).get("usd", 0) or 0)
     price_native = float(chosen.get("priceNative") or 0)
 
     if quote_addr == SOL_MINT:
@@ -568,6 +665,116 @@ def _resolve_dry_run_pair(token_address: str, pinned_pair_address: str = "") -> 
               f"{token_address[:8]}...; using priceUsd → SOL via ref")
     info["price_sol"] = info["price_usd"] / sol_usd
     return info
+
+
+def _worst_of_two_price(token_address: str, pinned_pair: str, leg_type: str) -> dict:
+    """H-1: Sample price twice with a configurable delay between, return the
+    worse of the two as a price_info dict (same shape as _resolve_dry_run_pair).
+
+    `leg_type="sell"`: use the LOWER price_sol (worse outcome for seller).
+    `leg_type="buy"`:  use the HIGHER price_sol (worse outcome for buyer).
+
+    Models the submit→confirm window where the price you observed at trigger
+    has already moved by the time the swap lands. Real-life delta in this
+    window is 5-15% on volatile memecoins; we don't fake the delta, we just
+    sample twice and pick the worse one, letting natural market movement
+    over `fill_delay_sec` provide the realism.
+
+    If `fill_delay_sec=0` (test mode), still samples twice (the second call
+    may hit a cached or different value); behavior is deterministic against
+    mocks. Both samples' `liquidity_usd` are kept on the chosen one.
+
+    On price-lookup failure (price_sol <= 0), returns the first sample
+    unchanged — the caller still sees the failure and applies its existing
+    branches (drained pool / no usable price / etc.).
+    """
+    sample1 = _resolve_dry_run_pair(token_address, pinned_pair)
+    delay = max(0, CONFIG.get("fill_delay_sec", 0))
+    if delay > 0:
+        time.sleep(delay)
+    sample2 = _resolve_dry_run_pair(token_address, pinned_pair)
+
+    # If either sample failed, defer to whichever is valid — but prefer the
+    # one with a usable price so downstream logic gets the best diagnostic.
+    if sample1["price_sol"] <= 0 and sample2["price_sol"] <= 0:
+        return sample1
+    if sample1["price_sol"] <= 0:
+        return sample2
+    if sample2["price_sol"] <= 0:
+        return sample1
+
+    if leg_type == "sell":
+        worse = sample1 if sample1["price_sol"] <= sample2["price_sol"] else sample2
+        better = sample2 if worse is sample1 else sample1
+    elif leg_type == "buy":
+        worse = sample1 if sample1["price_sol"] >= sample2["price_sol"] else sample2
+        better = sample2 if worse is sample1 else sample1
+    else:
+        return sample1  # unknown leg — just return first sample
+
+    # Tag with a diagnostic so the caller's log line can show both samples.
+    worse["_fill_sim_chosen"] = worse["price_sol"]
+    worse["_fill_sim_other"] = better["price_sol"]
+    worse["_fill_sim_leg"] = leg_type
+    return worse
+
+
+def _estimate_slippage_pct(trade_value_usd: float, liquidity_usd: float) -> float:
+    """C-1: Crude price-impact model based on share of pool consumed.
+
+    Model:
+      pool_share = trade_value_usd / max(liquidity_usd, $1)
+      slippage   = min(0.20, pool_share * 2.0)
+
+    Rationale (constant-product AMM, x*y=k):
+      A trade that consumes fraction f of a pool moves price by ~f / (1-f).
+      For small f this is ~f; we apply a 2× multiplier to bound at 20 % since
+      DexScreener's `liquidity.usd` is one-sided (the SOL/USDC side); a 50 %
+      share of that == roughly 25 % of total pool depth on an AMM. The hard
+      20 % cap reflects that beyond a certain point Jupiter simply won't route.
+
+    Returns: slippage as a decimal (0.05 == 5 % price impact).
+    """
+    if liquidity_usd <= 0:
+        # Unknown liquidity — refuse to estimate. Caller decides whether to
+        # block or proceed; we don't want to silently apply 0 %.
+        return 0.0
+    pool_share = trade_value_usd / max(liquidity_usd, 1.0)
+    return min(0.20, pool_share * 2.0)
+
+
+def _apply_dry_run_costs(sol_amount: float, leg_type: str) -> tuple:
+    """C-2 + C-3: Apply realistic transaction costs to a dry-run SOL amount.
+
+    `leg_type`: "buy" or "sell".
+
+    Live mode pays:
+      - Jupiter's blended platform fee (~0.85%) on every swap
+      - Solana base sig fee + priority fee + Jito tip per tx
+        (default total ~0.000115 SOL per transaction)
+
+    For a BUY: the user spends `sol_amount` gross but the swap routes only
+    `gross × (1 - jup_pct)` worth of SOL into tokens, AND must pay the network
+    fee on top. Net buying power = sol_amount × (1 - jup_pct) - network_fee.
+
+    For a SELL: pool yields `sol_amount` gross; Jupiter takes its cut and we
+    pay network fee. Net received = sol_amount × (1 - jup_pct) - network_fee.
+
+    Returns (net_amount, fees_dict) where fees_dict captures the components for
+    logging.
+    """
+    jup_pct = CONFIG["jupiter_fee_pct"]
+    net_fee = CONFIG["network_fee_sol"]
+    jup_drag = sol_amount * jup_pct
+    net = sol_amount - jup_drag - net_fee
+    net = max(0.0, net)  # never go negative — real txs would just fail
+    return net, {
+        "leg": leg_type,
+        "gross_sol": round(sol_amount, 9),
+        "jupiter_fee_sol": round(jup_drag, 9),
+        "network_fee_sol": net_fee,
+        "net_sol": round(net, 9),
+    }
 
 
 def get_dry_run_price(token_address: str, pinned_pair_address: str = "") -> tuple:
@@ -824,8 +1031,14 @@ class TradeLog:
 
 def execute_buy(wallet: Wallet, token_address: str, amount_sol: float,
                 token_name: str = "?", token_symbol: str = "?",
-                score: int = 0, url: str = "") -> Optional[Position]:
-    """Buy a token."""
+                score: int = 0, url: str = "",
+                trade_log: Optional["TradeLog"] = None) -> Optional[Position]:
+    """Buy a token.
+
+    `trade_log` (optional): when provided, refusals are logged as
+    `buy_refused` events with the safety_module's diagnostic tags
+    (sim_honeypot_unverified, sim_rugcheck_unavailable, …) so post-hoc
+    analysis can count failure modes."""
     amount_lamports = int(amount_sol * LAMPORTS_PER_SOL)
 
     print(f"\n  🛒 BUYING {token_name} (${token_symbol})")
@@ -835,12 +1048,35 @@ def execute_buy(wallet: Wallet, token_address: str, amount_sol: float,
     # ── SAFETY CHECK (pre-buy, FULL 6-layer gate) ──
     initial_holder_snapshot = []
     if SAFETY_AVAILABLE:
-        full_report = run_full_safety_check(token_address)
+        # C-4: pass dry-run flag so safety module can apply conservative posture
+        # when Jupiter is unreachable (honeypot inconclusive → block in dry-run).
+        full_report = run_full_safety_check(token_address, is_dry_run=CONFIG["dry_run"])
         print(summarize_full_report(full_report))
         initial_holder_snapshot = full_report.get("holder_snapshot", [])
 
         if not full_report["passed"]:
+            if full_report.get("sim_honeypot_unverified"):
+                print(f"     ❌ Buy refused: honeypot check unavailable "
+                      f"(Jupiter breaker open) — conservative dry-run posture")
+            if full_report.get("sim_rugcheck_unavailable"):
+                print(f"     ❌ Buy refused: RugCheck unavailable "
+                      f"— conservative dry-run posture (H-4)")
             print(f"     ❌ SAFETY CHECK FAILED — blocking: {full_report['blocking_reasons']}")
+            # Structured refusal log so the 24h summary / dashboards can count.
+            if trade_log is not None:
+                try:
+                    trade_log.log({
+                        "action": "buy_refused",
+                        "token": token_symbol,
+                        "token_address": token_address,
+                        "amount_sol_proposed": amount_sol,
+                        "score": score,
+                        "reasons": full_report["blocking_reasons"],
+                        "sim_honeypot_unverified": bool(full_report.get("sim_honeypot_unverified")),
+                        "sim_rugcheck_unavailable": bool(full_report.get("sim_rugcheck_unavailable")),
+                    })
+                except Exception as e:
+                    print(f"     ⚠️  Could not log buy_refused event: {e}")
             return None
         print(f"     ✅ Full safety check passed (score: {full_report['score']}/100)")
     else:
@@ -870,7 +1106,9 @@ def execute_buy(wallet: Wallet, token_address: str, amount_sol: float,
         # tokens are USDC-quoted at launch). _resolve_dry_run_pair returns rich
         # metadata so we can log quote currency + DEX. Jupiter stays for live
         # execution and for the safety honeypot check.
-        price_info = _resolve_dry_run_pair(token_address)
+        # H-1: sample twice with fill_delay_sec between to model the
+        # submit→confirm window. For buys we pick the HIGHER (worse) price.
+        price_info = _worst_of_two_price(token_address, "", leg_type="buy")
         ds_price_sol = price_info["price_sol"]
         ds_price_usd = price_info["price_usd"]
         pinned_pair = price_info["pair_address"]
@@ -883,16 +1121,50 @@ def execute_buy(wallet: Wallet, token_address: str, amount_sol: float,
                   f"{token_address[:8]}... — skipping (no useless 0-token position created)")
             return None
 
-        sim_tokens = int(amount_sol / ds_price_sol)
-        if sim_tokens <= 0:
-            # Numerically possible if price_sol is huge (very expensive token vs. tiny buy).
-            # Refuse rather than recording a 0-token position.
-            print(f"     ❌ DRY-RUN BUY ABORTED: computed 0 tokens for "
-                  f"{amount_sol} SOL @ {ds_price_sol:.10f} SOL/token "
-                  f"(quote: {quote_symbol} via {dex_id}) — skipping")
+        # H-1 diagnostic — visible only when the two samples differ.
+        if "_fill_sim_other" in price_info and price_info["_fill_sim_chosen"] != price_info["_fill_sim_other"]:
+            print(f"     ⏱️  Fill simulation: price1={price_info['_fill_sim_other']:.10f}, "
+                  f"price2={price_info['_fill_sim_chosen']:.10f}, "
+                  f"using HIGHER (buy worse-of-2)")
+
+        # C-2 + C-3: deduct Jupiter fee and network fees from the buy budget
+        # before computing how many tokens we actually receive.
+        net_budget_sol, buy_fees = _apply_dry_run_costs(amount_sol, leg_type="buy")
+        if net_budget_sol <= 0:
+            print(f"     ❌ DRY-RUN BUY ABORTED: fees ({buy_fees['jupiter_fee_sol']} jup + "
+                  f"{buy_fees['network_fee_sol']} net) consumed entire budget "
+                  f"{amount_sol} SOL — buy too small")
             return None
 
-        sim_price_sol = ds_price_sol
+        # C-1: apply slippage on the buy. The trade value (USD) is the SOL
+        # spent × SOL/USD reference (or the equivalent priceUsd × tokens).
+        # We estimate slippage from pool depth and reduce sim_tokens accordingly.
+        pool_liq_usd = price_info.get("liquidity_usd", 0.0)
+        # Convert net_budget_sol → USD via the chosen pair's price.
+        # SOL-quoted: price_usd ≈ SOL price × price_native; we already have
+        # ds_price_usd directly and don't need to round-trip.
+        if ds_price_sol > 0 and ds_price_usd > 0:
+            trade_usd = net_budget_sol * (ds_price_usd / ds_price_sol)
+        else:
+            trade_usd = 0.0
+        slippage = _estimate_slippage_pct(trade_usd, pool_liq_usd)
+        # Buyer pays the slippage too: effective price ≈ spot × (1 + slippage),
+        # so tokens received ≈ net_budget / (spot × (1 + slippage)).
+        effective_buy_price = ds_price_sol * (1 + slippage)
+        sim_tokens = int(net_budget_sol / effective_buy_price)
+        if sim_tokens <= 0:
+            print(f"     ❌ DRY-RUN BUY ABORTED: computed 0 tokens for "
+                  f"net budget {net_budget_sol:.6f} SOL @ {effective_buy_price:.10f} SOL/token "
+                  f"(after {slippage*100:.2f}% slippage; quote: {quote_symbol} via {dex_id}) — skipping")
+            return None
+
+        sim_price_sol = effective_buy_price  # record what we actually paid per token
+        print(f"     💸 Fees: -{buy_fees['jupiter_fee_sol']:.6f} Jupiter (0.85%), "
+              f"-{buy_fees['network_fee_sol']:.6f} network → "
+              f"net buy budget {net_budget_sol:.6f} SOL")
+        print(f"     📉 Slippage: {slippage*100:.2f}% "
+              f"(${trade_usd:.2f} into ${pool_liq_usd:,.0f} pool = "
+              f"{(trade_usd/max(pool_liq_usd,1))*100:.3f}% share)")
 
         # Headline log line — exposes quote currency so we can see at a glance
         # whether the simulated buy used the SOL pool or a USDC conversion.
@@ -987,10 +1259,19 @@ def execute_buy(wallet: Wallet, token_address: str, amount_sol: float,
     return pos
 
 
-def execute_sell(wallet: Wallet, position: Position, sell_pct: float, reason: str = "") -> bool:
+def execute_sell(wallet: Wallet, position: Position, sell_pct: float,
+                 reason: str = "",
+                 trade_log: Optional["TradeLog"] = None) -> bool:
     """Sell a percentage of position. Falls back to selling everything as 'dust'
     if the requested amount is too small to actually move tokens or is below the
-    fee-recovery threshold."""
+    fee-recovery threshold.
+
+    `trade_log` (optional): when provided, terminal-status transitions to
+    "rugged" (C-5 drained pool) or "suspect" (100x implausibility guard) are
+    logged as separate structured events so the 24h summary can count them."""
+    # Snapshot status BEFORE sell so we can detect transitions even though the
+    # caller logs its own action event afterward.
+    status_before = position.status
     requested = int(position.tokens_remaining * (sell_pct / 100))
     tokens_to_sell = requested
 
@@ -1032,17 +1313,63 @@ def execute_sell(wallet: Wallet, position: Position, sell_pct: float, reason: st
         # on the AWS host. Re-fetch each time so cascade decisions reflect the
         # current price, not the price at sell-trigger evaluation time.
         sim_sol_out = 0
-        price_sol, _, _ = get_dry_run_price(position.token_address, pinned)
-        if price_sol > 0:
-            sim_sol_out = tokens_to_sell * price_sol
+        # H-1: sample twice with fill_delay_sec between, use the WORSE price
+        # (lower for sells) to model submit→confirm latency.
+        price_info_sell = _worst_of_two_price(position.token_address, pinned, leg_type="sell")
+        price_sol = price_info_sell["price_sol"]
+        price_usd = price_info_sell["price_usd"]
+        pool_liq_usd = price_info_sell.get("liquidity_usd", 0.0)
+        if "_fill_sim_other" in price_info_sell and \
+                price_info_sell["_fill_sim_chosen"] != price_info_sell["_fill_sim_other"]:
+            print(f"     ⏱️  Fill simulation: price1={price_info_sell['_fill_sim_other']:.10f}, "
+                  f"price2={price_info_sell['_fill_sim_chosen']:.10f}, "
+                  f"using LOWER (sell worse-of-2)")
+
+        # ── C-5: DRAINED POOL REFUSAL ──
+        # When current pool liquidity is below the threshold, the pool is
+        # effectively unsellable. DexScreener's last priceNative is stale and
+        # cannot be honored on-chain. Real outcome: 0 SOL.
+        # This replaces the prior 10x-cap + 100x-implausibility hacks for the
+        # drained-pool case; the 100x sanity check below still catches OTHER
+        # bad-data cases (wrong-quote pair, decimals mismatch, etc.).
+        drained_threshold = CONFIG.get("drained_pool_threshold_usd", 500)
+        is_drained = price_sol > 0 and pool_liq_usd > 0 and pool_liq_usd < drained_threshold
+        # Also treat "no price data at all on emergency-sell" as drained:
+        # DexScreener returned nothing usable AND we're in an emergency.
+        is_drained_no_data = (price_sol <= 0) and ("EMERGENCY" in reason or "Liquidity dropped" in reason)
+        if is_drained or is_drained_no_data:
+            baseline = getattr(position, "liquidity_at_buy", 0) or 0
+            print(f"     💀 DRAINED POOL: liquidity ${pool_liq_usd:,.0f} "
+                  f"(baseline at buy: ${baseline:,.0f}, threshold: ${drained_threshold}) — "
+                  f"refusing to record exit proceeds (real outcome: 0 SOL)")
+            sim_sol_out = 0
+            position.status = "rugged"
+            # Skip slippage / fee / 100x-cap blocks entirely; nothing to compute.
+        elif price_sol > 0:
+            # C-1: slippage applied to the spot value BEFORE fees.
+            gross_at_spot = tokens_to_sell * price_sol
+            if price_sol > 0 and price_usd > 0:
+                trade_usd = gross_at_spot * (price_usd / price_sol)
+            else:
+                trade_usd = 0.0
+            slippage = _estimate_slippage_pct(trade_usd, pool_liq_usd)
+            # Seller eats the slippage: effective price ≈ spot × (1 - slippage)
+            gross_after_slippage = gross_at_spot * (1 - slippage)
+            # C-2 + C-3: deduct Jupiter fee and network fees from the gross.
+            sim_sol_out, sell_fees = _apply_dry_run_costs(gross_after_slippage, leg_type="sell")
+            print(f"     📉 Slippage: {slippage*100:.2f}% "
+                  f"(${trade_usd:.2f} into ${pool_liq_usd:,.0f} pool) → "
+                  f"{gross_at_spot:.6f} → {gross_after_slippage:.6f} SOL")
+            print(f"     💸 Fees: -{sell_fees['jupiter_fee_sol']:.6f} Jupiter, "
+                  f"-{sell_fees['network_fee_sol']:.6f} network → "
+                  f"net {sim_sol_out:.6f} SOL")
 
         # SANITY CHECK: any single sell yielding more than 100x the original buy_amount is
         # almost certainly a data bug (wrong-quote pair, stale dead-pair price, decimals
         # mismatch). Flag, log loudly, and DO NOT record the bogus value.
-        # Why 100x not 1000x: a cascade sell is at most 12% of remaining tokens; for that
-        # slice alone to exceed 100x the original total investment, the underlying token
-        # would need ~1000x growth. Possible but rare enough that we'd rather skip the
-        # record than poison the trade log with bad data.
+        # NOTE: drained-pool case is now handled BEFORE this — the C-5 block sets
+        # sim_sol_out=0 and status="rugged" already. This guard remains for other
+        # implausibility sources (decimals, wrong-quote pair, etc.).
         max_plausible = position.buy_amount_sol * 100.0
         if sim_sol_out > max_plausible and max_plausible > 0:
             print(f"     🛑 Implausible sell value {sim_sol_out:.4f} SOL "
@@ -1050,28 +1377,29 @@ def execute_sell(wallet: Wallet, position: Position, sell_pct: float, reason: st
                   f"Recording 0 received and marking position as 'suspect'.")
             sim_sol_out = 0
             position.status = "suspect"
-        # Emergency-sell special case: if the pool is drained (this branch rarely fires now
-        # that get_dexscreener_price filters dead pairs, but defense in depth) we may still
-        # land here with a stale price. Record what we got but cap at buy_amount as a last
-        # resort if it still looks weird.
-        elif "Liquidity dropped" in reason and sim_sol_out > position.buy_amount_sol * 10:
-            print(f"     ⚠️  Emergency sell into drained pool reported {sim_sol_out:.4f} SOL — "
-                  f"capping at 10x buy ({position.buy_amount_sol * 10:.4f} SOL) as defensive estimate")
-            sim_sol_out = position.buy_amount_sol * 10
         print(f"     📊 Simulated: ~{sim_sol_out:.6f} SOL received")
         position.tokens_remaining -= tokens_to_sell
         position.total_sold_sol += sim_sol_out
+        # Preserve special terminal statuses set above (rugged from C-5,
+        # suspect from the 100x guard) — only assign closed/dust if the
+        # status is still "open" or "partial".
         if position.tokens_remaining <= 0 or dust_close:
-            position.status = "dust" if dust_close else "closed"
+            if position.status not in ("rugged", "suspect"):
+                position.status = "dust" if dust_close else "closed"
             position.tokens_remaining = 0
         else:
-            position.status = "partial"
+            # Preserve special terminal statuses here too — a partial sell
+            # that triggered the 100x guard or drained-pool guard should NOT
+            # be reclassified back to "partial".
+            if position.status not in ("rugged", "suspect"):
+                position.status = "partial"
         position.sells.append({
             "pct": sell_pct, "tokens": tokens_to_sell,
             "sol_received": sim_sol_out, "reason": reason,
             "tx": "DRY_RUN",
             "time": datetime.now(timezone.utc).isoformat(),
         })
+        _log_terminal_transition_if_needed(trade_log, position, status_before, reason)
         return True
 
     # 1. Quote
@@ -1123,7 +1451,7 @@ def execute_sell(wallet: Wallet, position: Position, sell_pct: float, reason: st
         "tx": signature,
         "time": datetime.now(timezone.utc).isoformat(),
     })
-
+    _log_terminal_transition_if_needed(trade_log, position, status_before, reason)
     return True
 
 
@@ -1208,7 +1536,8 @@ def check_positions(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
                         "liquidity": cont.get("liquidity"),
                         "mint": cont.get("mint"),
                     })
-                    if execute_sell(wallet, pos, 100, f"EMERGENCY: {reasons[:80]}"):
+                    if execute_sell(wallet, pos, 100, f"EMERGENCY: {reasons[:80]}",
+                                    trade_log=trade_log):
                         trade_log.log({
                             "action": "emergency_sell",
                             "token": pos.token_symbol,
@@ -1288,7 +1617,9 @@ def check_positions(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
             sell_pct = min(95, (tokens_for_investment / pos.tokens_remaining) * 100)
 
             print(f"     🎯 TAKE PROFIT #1! Price +{price_change_pct:.0f}% — selling {sell_pct:.0f}% to recover investment")
-            if execute_sell(wallet, pos, sell_pct, f"TP1: recover investment at price +{price_change_pct:.0f}%"):
+            if execute_sell(wallet, pos, sell_pct,
+                            f"TP1: recover investment at price +{price_change_pct:.0f}%",
+                            trade_log=trade_log):
                 pos.cascade_level = 1
                 pos.peak_pnl_pct = max(pos.peak_pnl_pct, pnl_pct)
                 trade_log.log({
@@ -1312,7 +1643,9 @@ def check_positions(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
                     sell_pct = c["moonbag_sell_pct"] * 100  # fraction → percentage
                     next_level = pos.cascade_level + 1
                     print(f"     🚀 CASCADE #{next_level}! Price +{price_change_pct:.0f}% (threshold +{next_cascade_pct:.0f}%) — selling {sell_pct:.0f}% of remaining")
-                    if execute_sell(wallet, pos, sell_pct, f"Cascade #{next_level} at price +{price_change_pct:.0f}%"):
+                    if execute_sell(wallet, pos, sell_pct,
+                                    f"Cascade #{next_level} at price +{price_change_pct:.0f}%",
+                                    trade_log=trade_log):
                         pos.cascade_level = next_level
                         pos.peak_pnl_pct = max(pos.peak_pnl_pct, pnl_pct)
                         trade_log.log({
@@ -1328,7 +1661,8 @@ def check_positions(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
         # ── STOP LOSS (still PnL-based, only active before TP1) ──
         if pnl_pct <= c["stop_loss_pct"] and pos.cascade_level == 0:
             print(f"     🛑 STOP LOSS! Bag PnL {pnl_pct:.0f}% — selling everything")
-            if execute_sell(wallet, pos, 100, f"SL at PnL {pnl_pct:.0f}%"):
+            if execute_sell(wallet, pos, 100, f"SL at PnL {pnl_pct:.0f}%",
+                            trade_log=trade_log):
                 trade_log.log({
                     "action": "stop_loss", "token": pos.token_symbol,
                     "pnl_pct": pnl_pct,
@@ -1435,6 +1769,7 @@ def process_sniper_alerts(wallet: Wallet, pm: PositionManager, trade_log: TradeL
                     token_symbol=det.get("token_symbol", "?"),
                     score=score,
                     url=det.get("url", ""),
+                    trade_log=trade_log,
                 )
 
                 if pos:
@@ -1626,7 +1961,7 @@ def main():
             print("  ❌ Wallet nie skonfigurowany!")
             return
 
-        pos = execute_buy(wallet, token_addr, amount_sol)
+        pos = execute_buy(wallet, token_addr, amount_sol, trade_log=trade_log)
         if pos:
             pm.add(pos)
             trade_log.log({"action": "manual_buy", "token": pos.token_symbol, "amount_sol": amount_sol})
@@ -1651,7 +1986,7 @@ def main():
             print(f"  ❌ Nie znaleziono pozycji dla {token_addr}")
             return
 
-        if execute_sell(wallet, pos, sell_pct, "Manual sell"):
+        if execute_sell(wallet, pos, sell_pct, "Manual sell", trade_log=trade_log):
             pm.save()
             trade_log.log({"action": "manual_sell", "token": pos.token_symbol, "sell_pct": sell_pct})
             print("  ✅ Sprzedaż wykonana!")
@@ -1764,6 +2099,10 @@ def main():
 
     if wallet and wallet.ready:
         show_status(wallet, pm)
+
+    # 24h diagnostic summary — surfaces honeypot-unverified / rugcheck-unavailable
+    # refusals and drained-pool ruggings so the operator can see API health at a glance.
+    _print_24h_summary(trade_log)
 
     print(f"  🚀 Startuje auto-mode. Ctrl+C aby zatrzymać.")
     print(f"  📂 Czekam na alerty z Liftoff Sniper w sniper_alerts/")
