@@ -591,6 +591,12 @@ def _resolve_dry_run_pair(token_address: str, pinned_pair_address: str = "") -> 
         quote_symbol   — "SOL", "USDC", "USDT", … (for log lines)
         dex_id         — "raydium", "orca", "meteora", … (for log lines)
         sol_usd_ref    — the SOL/USD price used for conversion (0 for SOL-quoted)
+        error_reason   — "" on success; one of "api_error", "no_pairs",
+                         "no_live_pairs", "no_usable_price",
+                         "sol_usd_ref_missing" on failure
+        error_detail   — human-readable string describing the failure with
+                         enough context to debug (e.g. pinned-pair tried,
+                         number of pairs returned, breakdown by chain/quote)
     """
     info = {
         "price_sol": 0.0, "price_usd": 0.0, "pair_address": "",
@@ -598,6 +604,10 @@ def _resolve_dry_run_pair(token_address: str, pinned_pair_address: str = "") -> 
         # C-1: chosen pair's liquidity (USD) — used by slippage model.
         # Zero on failure paths or when no chosen pair.
         "liquidity_usd": 0.0,
+        # Monitoring-loop diagnostics: populated on every failure path so the
+        # caller (check_positions) can render a useful "price lookup failed"
+        # log instead of the historical opaque "no price data, skipping".
+        "error_reason": "", "error_detail": "",
     }
     try:
         resp = requests.get(
@@ -608,10 +618,17 @@ def _resolve_dry_run_pair(token_address: str, pinned_pair_address: str = "") -> 
         resp.raise_for_status()
         pairs = (resp.json() or {}).get("pairs") or []
     except Exception as e:
+        info["error_reason"] = "api_error"
+        info["error_detail"] = f"DexScreener /tokens/{token_address[:12]}... failed: {e}"
         print(f"     ⚠️  DexScreener fetch error: {e}")
         return info
 
     if not pairs:
+        info["error_reason"] = "no_pairs"
+        info["error_detail"] = (
+            f"DexScreener returned 0 pairs for {token_address[:12]}... "
+            f"(token may be too new / not indexed / wrong address)"
+        )
         return info
 
     # Solana chain only, with non-zero liquidity (dead pairs report stale prices)
@@ -621,6 +638,20 @@ def _resolve_dry_run_pair(token_address: str, pinned_pair_address: str = "") -> 
         and ((p.get("liquidity") or {}).get("usd", 0) or 0) > 0
     ]
     if not live_pairs:
+        # Build a breakdown of what WAS returned so the failure log is debuggable
+        breakdown = []
+        for p in pairs[:5]:
+            chain = p.get("chainId", "?")
+            quote = (p.get("quoteToken") or {}).get("symbol", "?")
+            liq = (p.get("liquidity") or {}).get("usd", 0) or 0
+            pair_id = (p.get("pairAddress") or "")[:8]
+            breakdown.append(f"{pair_id}/{chain}/{quote}/liq=${liq:.0f}")
+        more = f" (+{len(pairs) - 5} more)" if len(pairs) > 5 else ""
+        info["error_reason"] = "no_live_pairs"
+        info["error_detail"] = (
+            f"{len(pairs)} pair(s) returned but none are live Solana pools. "
+            f"Breakdown: {' | '.join(breakdown)}{more}"
+        )
         return info
 
     # Prefer the pinned pair if it's still live — keeps PnL math consistent
@@ -646,17 +677,32 @@ def _resolve_dry_run_pair(token_address: str, pinned_pair_address: str = "") -> 
         # SOL-quoted: priceNative IS SOL per token; no conversion needed.
         if price_native > 0:
             info["price_sol"] = price_native
+            return info
+        info["error_reason"] = "no_usable_price"
+        info["error_detail"] = (
+            f"SOL-quoted pair {info['pair_address'][:8]}... has priceNative=0 "
+            f"(stale / API hiccup); priceUsd={info['price_usd']}"
+        )
         return info
 
     # Non-SOL quote (USDC/USDT, and as a fallback any other quote where DexScreener
     # gives us a non-zero priceUsd we can trust). Convert via the SOL/USDC ref.
     if info["price_usd"] <= 0:
+        info["error_reason"] = "no_usable_price"
+        info["error_detail"] = (
+            f"{info['quote_symbol']}-quoted pair {info['pair_address'][:8]}... "
+            f"has priceUsd=0 (stale / API hiccup)"
+        )
         return info
     sol_usd = _get_sol_usd_price()
     info["sol_usd_ref"] = sol_usd
     if sol_usd <= 0:
-        print(f"     ⚠️  SOL/USD reference unavailable; cannot convert "
-              f"{info['quote_symbol']}-quoted price for {token_address[:8]}...")
+        info["error_reason"] = "sol_usd_ref_missing"
+        info["error_detail"] = (
+            f"SOL/USDC reference unavailable; cannot convert "
+            f"{info['quote_symbol']}-quoted price for {token_address[:12]}..."
+        )
+        print(f"     ⚠️  {info['error_detail']}")
         return info
     if quote_addr not in USD_STABLE_MINTS:
         # Exotic quote — log it so we know what was used. Still safe to convert
@@ -1550,17 +1596,34 @@ def check_positions(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
 
         current_value_sol = 0
         if CONFIG["dry_run"]:
-            # Dry-run: use DexScreener price on the pinned pair (consistent across cycles).
-            # If pinned pair died, get_dexscreener_price falls back to highest-liq pair.
+            # Dry-run: use _resolve_dry_run_pair so we get USDC-quoted support
+            # AND structured diagnostics. The old get_dexscreener_price filtered
+            # to SOL-only pairs, which caused open positions on USDC-quoted
+            # pump.fun tokens to log "no price data" indefinitely.
             pinned = getattr(pos, "pair_address", "") or ""
-            price_sol, _, used_pair = get_dexscreener_price(pos.token_address, pinned)
+            price_info = _resolve_dry_run_pair(pos.token_address, pinned)
+            price_sol = price_info["price_sol"]
+            used_pair = price_info["pair_address"]
             if price_sol <= 0:
-                print(f"     ⚠️  {pos.token_name}: no price data, skipping")
+                # Detailed failure log — the previous "no price data" was a
+                # debugging black hole. Now we surface reason, pinned pair
+                # tried, and (when relevant) the breakdown of pairs the API
+                # actually returned.
+                reason = price_info.get("error_reason") or "unknown"
+                detail = price_info.get("error_detail") or "(no detail captured)"
+                pinned_label = pinned[:8] + "..." if pinned else "(none)"
+                print(f"     ⚠️  {pos.token_name} ({pos.token_symbol}): "
+                      f"price lookup failed, skipping cycle")
+                print(f"        reason: {reason}")
+                print(f"        pinned pair tried: {pinned_label}")
+                print(f"        detail: {detail}")
                 pm.save()  # persist any safety-check timestamps
                 continue
             # If we fell back to a different pair (pinned died), update the pin
             if pinned and used_pair and used_pair != pinned:
-                print(f"     🔁 {pos.token_name}: pinned pair {pinned[:8]}... dead, switched to {used_pair[:8]}...")
+                print(f"     🔁 {pos.token_name}: pinned pair {pinned[:8]}... "
+                      f"dead, switched to {used_pair[:8]}... "
+                      f"(quote: {price_info['quote_symbol']} via {price_info['dex_id']})")
                 pos.pair_address = used_pair
             current_value_sol = pos.tokens_remaining * price_sol
         else:
