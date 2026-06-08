@@ -174,8 +174,12 @@ CONFIG = {
     ],
 
     # ── Jupiter API ──
-    "jupiter_quote_url": "https://quote-api.jup.ag/v6/quote",
-    "jupiter_swap_url": "https://quote-api.jup.ag/v6/swap",
+    # Migrated 2026-06-08 from the now-decommissioned `quote-api.jup.ag/v6/*`
+    # endpoints to `lite-api.jup.ag/swap/v1/*` (free tier, no API key required).
+    # `api.jup.ag/swap/v1/*` is the same shape but routes through the paid
+    # Ultra tier; switch if you ever buy an API key.
+    "jupiter_quote_url": "https://lite-api.jup.ag/swap/v1/quote",
+    "jupiter_swap_url": "https://lite-api.jup.ag/swap/v1/swap",
 
     # ── Trading Parameters ──
     "buy_amount_sol": 0.01,            # Ile SOL wydać na jeden zakup (~$1.50)
@@ -237,7 +241,12 @@ CONFIG = {
 }
 
 # Solana constants
-SOL_MINT = "So11111111111111111111111111111111111111111112"
+# Wrapped SOL mint — canonical SPL Token Program constant, 44 chars (base58).
+# Was previously 46 chars (2 extra "1"s), which Jupiter v6 silently accepted
+# until they tightened parameter validation and started returning
+# "inputMint cannot be parsed: WrongSize". This was the root cause of every
+# honeypot check failing on AWS (chained C-4 → sim_honeypot_unverified blocks).
+SOL_MINT = "So111111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
 # Quote-currency mints used by the dry-run pair resolver. Most new pump.fun
