@@ -241,12 +241,18 @@ CONFIG = {
 }
 
 # Solana constants
-# Wrapped SOL mint — canonical SPL Token Program constant, 44 chars (base58).
-# Was previously 46 chars (2 extra "1"s), which Jupiter v6 silently accepted
-# until they tightened parameter validation and started returning
-# "inputMint cannot be parsed: WrongSize". This was the root cause of every
-# honeypot check failing on AWS (chained C-4 → sim_honeypot_unverified blocks).
-SOL_MINT = "So111111111111111111111111111111111111111112"
+# Wrapped SOL mint — canonical SPL Token Program constant, 43 chars (base58).
+# History of getting this wrong (it took 3 tries):
+#   46 chars (3 extra "1"s) — original, Jupiter v6 silently accepted it
+#   44 chars (1 extra "1")  — first fix attempt; still rejected by new v1
+#   43 chars                — correct. Verified against Jupiter's own response:
+#                             {"inputMint": "So11111111111111111111111111111111111111112", ...}
+# Why 43 and not 44 like most Solana mints: WSOL's underlying 32 bytes start
+# with [0x06, 0x9b, ...], whose high-value first byte gives a shorter base58
+# encoding. USDC/USDT and most program IDs are 44 because their first byte is
+# smaller. The "1" character in base58 represents zero, so leading 1's are
+# leading zero-bytes — WSOL has fewer of them than it looks.
+SOL_MINT = "So11111111111111111111111111111111111111112"
 LAMPORTS_PER_SOL = 1_000_000_000
 
 # Quote-currency mints used by the dry-run pair resolver. Most new pump.fun
