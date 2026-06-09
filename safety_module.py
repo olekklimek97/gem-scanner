@@ -28,9 +28,9 @@ RUGCHECK_API = "https://api.rugcheck.xyz"
 # Jupiter v6 was decommissioned mid-2026; migrated to the lite-api swap/v1 path
 # (free tier, no API key). See trading_bot.py CONFIG for the migration note.
 JUPITER_QUOTE_URL = "https://lite-api.jup.ag/swap/v1/quote"
-# Wrapped SOL mint — canonical 44-char base58 (was 46 chars previously, which
-# Jupiter v6 silently accepted but newer endpoints reject as "WrongSize").
-SOL_MINT = "So111111111111111111111111111111111111111112"
+# Wrapped SOL mint — canonical 43-char base58. See trading_bot.py for the
+# off-by-one history (46→44→43 across three commits).
+SOL_MINT = "So11111111111111111111111111111111111111112"
 
 # Jupiter circuit breaker (mirrors trading_bot but module-local to avoid coupling)
 _JUPITER_CB = {

@@ -25,9 +25,9 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from db import get_scan_history, get_scan_details, get_latest_scan
 
 PORT = 8420
-# Wrapped SOL mint — canonical 44-char base58. See trading_bot.py for the
-# migration note (was 46 chars, broke Jupiter integration in 2026-06).
-SOL_MINT = "So111111111111111111111111111111111111111112"
+# Wrapped SOL mint — canonical 43-char base58. See trading_bot.py for full
+# off-by-one history (46→44→43).
+SOL_MINT = "So11111111111111111111111111111111111111112"
 # H-3: USDC/USDT mints + SOL/USDC ref pair, mirroring trading_bot.py so the
 # dashboard can convert USDC-quoted prices to SOL-equivalent without depending
 # on trading_bot's runtime state.
