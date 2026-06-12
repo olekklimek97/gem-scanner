@@ -1651,6 +1651,12 @@ def check_positions(wallet: Wallet, pm: PositionManager, trade_log: TradeLog):
         # PnL on the *remaining bag* against original investment (used for stop-loss + display only).
         pnl_pct = ((current_value_sol - pos.buy_amount_sol) / pos.buy_amount_sol * 100) if pos.buy_amount_sol > 0 else 0
 
+        # A-1 fix (audit #2): track the high-water mark on EVERY cycle with a
+        # fresh valuation — not only inside TP/cascade success branches. Without
+        # this, every position that dies before TP1 records peak_pnl_pct=0,
+        # making TP1/SL counterfactual analysis impossible.
+        pos.peak_pnl_pct = max(pos.peak_pnl_pct, pnl_pct)
+
         # ── DUST AUTO-CLOSE (moonbags only) ──
         # A moonbag that decayed below 0.001 SOL is worth less than fees. Close it so it stops
         # cluttering the dashboard and gets monitored in `closed/dust` view instead.
