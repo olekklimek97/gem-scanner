@@ -66,6 +66,7 @@ export function PositionsTable() {
                 <Th align="right">Score</Th>
                 <Th>Status</Th>
                 <Th align="right">Cascade</Th>
+                <Th align="right">Sells</Th>
                 <Th align="right">PnL %</Th>
                 <Th align="right">Time held</Th>
                 <Th align="right">Actions</Th>
@@ -74,14 +75,14 @@ export function PositionsTable() {
             <tbody>
               {isLoading && visible.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="p-8 text-center label-mono">
+                  <td colSpan={8} className="p-8 text-center label-mono">
                     Loading…
                   </td>
                 </tr>
               )}
               {!isLoading && visible.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="p-8 text-center label-mono">
+                  <td colSpan={8} className="p-8 text-center label-mono">
                     No active positions — bot is waiting for sniper signals
                   </td>
                 </tr>
@@ -150,6 +151,7 @@ function Row({ position: p }: { position: Position }) {
         <StatusBadge status={p.status} cascade={p.cascade_level} />
       </td>
       <td className="px-4 py-3 text-right font-mono">{p.cascade_level}</td>
+      <td className="px-4 py-3 text-right font-mono text-ink-dim">{p.sells_count}</td>
       <td
         className="px-4 py-3 text-right font-mono"
         style={{ color: accent }}
