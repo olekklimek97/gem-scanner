@@ -383,7 +383,10 @@ function renderPosition(p, type) {
   const badgeLabel = type === 'moonbag' ? '🌙 MOONBAG' : type === 'active' ? '⚡ ACTIVE' : '📦 CLOSED';
   const cascade = (p.cascade_level || 0);
   const pnlSol = (p.total_sold_sol || 0) - (p.buy_amount_sol || 0);
-  const sells = (p.sells || []);
+  // /api/positions returns sells_count (int). Fall back to a raw sells array
+  // if a future/legacy payload provides one. Reading p.sells alone was the bug:
+  // the enriched endpoint never includes the array, so it always rendered 0.
+  const sellsCount = (p.sells_count !== undefined) ? p.sells_count : (p.sells || []).length;
 
   return `<div class="position">
     <div class="pos-header">
@@ -402,8 +405,8 @@ function renderPosition(p, type) {
       Bought: <span>${formatSOL(p.buy_amount_sol)} SOL</span> · 
       Returned: <span>${formatSOL(p.total_sold_sol)} SOL</span> · 
       PnL: <span style="color:${pnlSol>=0?'#00FF88':'#FF4444'}">${pnlSol>=0?'+':''}${formatSOL(pnlSol)} SOL</span><br>
-      Age: <span>${ageHours(p.buy_time)}</span> · 
-      Sells: <span>${sells.length}</span> · 
+      Age: <span>${ageHours(p.buy_time)}</span> ·
+      Sells: <span>${sellsCount}</span> ·
       Tokens left: <span>${(p.tokens_remaining||0).toLocaleString()}</span><br>
       ${p.url ? `<a href="${p.url}" target="_blank">📊 DexScreener</a> · ` : ''}
       <span class="ca">CA: ${p.token_address || '?'}</span>
